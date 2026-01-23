@@ -224,6 +224,17 @@ func handlePlaylist(w http.ResponseWriter, r *http.Request) {
 		platform = "douyu"
 	}
 
+	// 获取基础 URL 用于构建代理地址
+	baseURL := r.URL.Query().Get("base_url")
+	if baseURL == "" {
+		scheme := "http"
+		if r.TLS != nil {
+			scheme = "https"
+		}
+		baseURL = fmt.Sprintf("%s://%s", scheme, r.Host)
+	}
+	baseURL = strings.TrimSuffix(baseURL, "/")
+
 	// 构建 M3U 播放列表
 	var playlist strings.Builder
 	playlist.WriteString("#EXTM3U\n")
@@ -265,11 +276,14 @@ func handlePlaylist(w http.ResponseWriter, r *http.Request) {
 				channelName = info.RoomName
 			}
 
+			// 使用代理地址
+			proxyURL := fmt.Sprintf("%s/live/bilibili/%s", baseURL, info.RoomID)
+			if qn > 0 {
+				proxyURL = fmt.Sprintf("%s?qn=%d", proxyURL, qn)
+			}
+
 			playlist.WriteString(fmt.Sprintf("#EXTINF:-1,%s\n", channelName))
-			// VLC 格式的 Referer 头
-			playlist.WriteString("#EXTVLCOPT:http-referrer=https://live.bilibili.com/\n")
-			// 通用 IPTV 格式（URL 后附加头信息）
-			playlist.WriteString(info.FlvURL + "|Referer=https://live.bilibili.com/\n")
+			playlist.WriteString(proxyURL + "\n")
 		}
 
 	default: // douyu
@@ -305,8 +319,14 @@ func handlePlaylist(w http.ResponseWriter, r *http.Request) {
 				channelName = info.RoomName
 			}
 
+			// 使用代理地址
+			proxyURL := fmt.Sprintf("%s/live/%s", baseURL, info.RoomID)
+			if rate > 0 {
+				proxyURL = fmt.Sprintf("%s?rate=%d", proxyURL, rate)
+			}
+
 			playlist.WriteString(fmt.Sprintf("#EXTINF:-1,%s\n", channelName))
-			playlist.WriteString(info.FlvURL + "\n")
+			playlist.WriteString(proxyURL + "\n")
 		}
 	}
 
