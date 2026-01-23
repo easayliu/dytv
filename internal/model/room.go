@@ -54,9 +54,17 @@ type CDNInfo struct {
 	IsH265 bool   `json:"isH265"`
 }
 
-// QualityMap maps quality names to rate values
+// QualityMap maps quality names to rate values for Douyu
 var QualityMap = map[string]int{
 	"high": 0, // 原画/高清
 	"mid":  2, // 超清
 	"low":  3, // 流畅
+}
+
+// BilibiliQualityMap maps quality names to qn values for Bilibili
+// Bilibili 清晰度: 80=流畅, 150=高清, 250=超清, 400=蓝光, 10000=原画
+var BilibiliQualityMap = map[string]int{
+	"high": 10000, // 原画
+	"mid":  400,   // 蓝光
+	"low":  150,   // 高清
 }
