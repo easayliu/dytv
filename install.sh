@@ -119,8 +119,9 @@ EOF
 
     sudo systemctl daemon-reload
     sudo systemctl enable ${SERVICE_NAME}
-    log "Service created: ${SERVICE_NAME}"
-    log "Start with: sudo systemctl start ${SERVICE_NAME}"
+    sudo systemctl start ${SERVICE_NAME}
+    log "Service created and started: ${SERVICE_NAME}"
+    log "Status: sudo systemctl status ${SERVICE_NAME}"
 }
 
 install_launchd() {
@@ -156,8 +157,9 @@ install_launchd() {
 </plist>
 EOF
 
-    log "Service created: ${PLIST_PATH}"
-    log "Start with: launchctl load ${PLIST_PATH}"
+    launchctl load "${PLIST_PATH}"
+    log "Service created and started: ${PLIST_PATH}"
+    log "Status: launchctl list | grep dytv"
 }
 
 uninstall() {
@@ -211,6 +213,61 @@ update_port() {
     fi
 }
 
+start_service() {
+    if [[ -f /etc/systemd/system/${SERVICE_NAME}.service ]]; then
+        sudo systemctl start ${SERVICE_NAME}
+        log "Service started"
+    fi
+
+    PLIST_PATH="$HOME/Library/LaunchAgents/com.dytv.plist"
+    if [[ -f "${PLIST_PATH}" ]]; then
+        launchctl load "${PLIST_PATH}" 2>/dev/null || true
+        log "Service started"
+    fi
+}
+
+stop_service() {
+    if [[ -f /etc/systemd/system/${SERVICE_NAME}.service ]]; then
+        sudo systemctl stop ${SERVICE_NAME}
+        log "Service stopped"
+    fi
+
+    PLIST_PATH="$HOME/Library/LaunchAgents/com.dytv.plist"
+    if [[ -f "${PLIST_PATH}" ]]; then
+        launchctl unload "${PLIST_PATH}" 2>/dev/null || true
+        log "Service stopped"
+    fi
+}
+
+restart_service() {
+    if [[ -f /etc/systemd/system/${SERVICE_NAME}.service ]]; then
+        sudo systemctl restart ${SERVICE_NAME}
+        log "Service restarted"
+    fi
+
+    PLIST_PATH="$HOME/Library/LaunchAgents/com.dytv.plist"
+    if [[ -f "${PLIST_PATH}" ]]; then
+        launchctl unload "${PLIST_PATH}" 2>/dev/null || true
+        launchctl load "${PLIST_PATH}"
+        log "Service restarted"
+    fi
+}
+
+status_service() {
+    if [[ -f /etc/systemd/system/${SERVICE_NAME}.service ]]; then
+        sudo systemctl status ${SERVICE_NAME} --no-pager
+        return
+    fi
+
+    PLIST_PATH="$HOME/Library/LaunchAgents/com.dytv.plist"
+    if [[ -f "${PLIST_PATH}" ]]; then
+        launchctl list | grep -E "PID|dytv" || log "Service not running"
+        return
+    fi
+
+    warn "Service not installed"
+}
+
 usage() {
     cat <<EOF
 Usage: $0 <command> [options]
@@ -218,9 +275,13 @@ Usage: $0 <command> [options]
 Commands:
   install          Download from release and install to ${INSTALL_DIR}
   install-source   Build from source and install
-  service          Download, install, and create system service
-  service-source   Build from source, install, and create system service
+  service          Download, install, create and start system service
+  service-source   Build from source, install, create and start system service
   uninstall        Remove binary and service
+  start            Start the service
+  stop             Stop the service
+  restart          Restart the service
+  status           Show service status
   set-port <port>  Update service port and restart
 
 Environment Variables:
@@ -235,14 +296,23 @@ Examples:
   # Install specific version
   VERSION=v1.0.0 $0 install
 
-  # Install and create service on port 9000
+  # Install and start service on port 9000
   PORT=9000 $0 service
 
   # Build from source and install
   $0 install-source
 
+  # Service management
+  $0 start
+  $0 stop
+  $0 restart
+  $0 status
+
   # Change service port
   $0 set-port 9000
+
+  # Uninstall
+  $0 uninstall
 EOF
 }
 
@@ -264,6 +334,7 @@ case "${1:-}" in
         else
             install_systemd
         fi
+        log "Service is running at http://localhost:${PORT}"
         ;;
     service-source)
         install_from_source
@@ -272,9 +343,22 @@ case "${1:-}" in
         else
             install_systemd
         fi
+        log "Service is running at http://localhost:${PORT}"
         ;;
     uninstall)
         uninstall
+        ;;
+    start)
+        start_service
+        ;;
+    stop)
+        stop_service
+        ;;
+    restart)
+        restart_service
+        ;;
+    status)
+        status_service
         ;;
     set-port)
         update_port "$2"

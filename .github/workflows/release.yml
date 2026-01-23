@@ -15,8 +15,13 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Install UPX
+        run: sudo apt-get update && sudo apt-get install -y upx
+
       - name: Build
-        run: CGO_ENABLED=0 go build -ldflags="-s -w" -o dytv ./cmd/dytv
+        run: |
+          CGO_ENABLED=0 go build -ldflags="-s -w" -o dytv ./cmd/dytv
+          upx --best --lzma dytv || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -36,19 +41,27 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Install UPX
+        run: sudo apt-get update && sudo apt-get install -y upx
+
       - name: Build releases
         run: |
           mkdir -p dist
           # Linux amd64
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o dist/dytv-linux-amd64 ./cmd/dytv
+          upx --best --lzma dist/dytv-linux-amd64 || true
           # Linux arm64
           GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o dist/dytv-linux-arm64 ./cmd/dytv
+          upx --best --lzma dist/dytv-linux-arm64 || true
           # macOS amd64
           GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o dist/dytv-darwin-amd64 ./cmd/dytv
+          upx --best --lzma dist/dytv-darwin-amd64 || true
           # macOS arm64
           GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="-s -w" -o dist/dytv-darwin-arm64 ./cmd/dytv
+          upx --best --lzma dist/dytv-darwin-arm64 || true
           # Windows amd64
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o dist/dytv-windows-amd64.exe ./cmd/dytv
+          upx --best --lzma dist/dytv-windows-amd64.exe || true
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
