@@ -14,11 +14,11 @@ import (
 )
 
 const (
-	DouyuRoomURL    = "https://www.douyu.com/%s"
-	DouyuAPIURL     = "https://www.douyu.com/lapi/live/getH5Play/%s"
-	DouyuBetardAPI  = "https://www.douyu.com/betard/%s"
-	DouyuSwfAPI     = "https://www.douyu.com/swf_api/homeH5Enc?rids=%s"
-	DouyuOpenAPI    = "https://open.douyucdn.cn/api/RoomApi/room/%s"
+	DouyuRoomURL   = "https://www.douyu.com/%s"
+	DouyuAPIURL    = "https://www.douyu.com/lapi/live/getH5Play/%s"
+	DouyuBetardAPI = "https://www.douyu.com/betard/%s"
+	DouyuSwfAPI    = "https://www.douyu.com/swf_api/homeH5Enc?rids=%s"
+	DouyuOpenAPI   = "https://open.douyucdn.cn/api/RoomApi/room/%s"
 )
 
 type DouyuClient struct {
@@ -137,13 +137,17 @@ func (c *DouyuClient) GetStreamURL(roomID string, rate int) (*model.RoomInfo, er
 	}
 
 	streamURL := ""
+	flvURL := ""
+
 	if streamData.RtmpURL != "" && streamData.RtmpLive != "" {
 		streamURL = fmt.Sprintf("%s/%s", streamData.RtmpURL, streamData.RtmpLive)
+		flvURL = streamURL
 	}
 
 	roomInfo := &model.RoomInfo{
 		RoomID:     realRoomID,
 		StreamURL:  streamURL,
+		FlvURL:     flvURL,
 		Multirates: streamData.Multirates,
 		IsLive:     streamURL != "",
 	}

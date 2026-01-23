@@ -37,3 +37,8 @@ func MD5Hash(s string) string {
 	h.Write([]byte(s))
 	return hex.EncodeToString(h.Sum(nil))
 }
+
+// MD5 is an alias for MD5Hash
+func MD5(s string) string {
+	return MD5Hash(s)
+}
