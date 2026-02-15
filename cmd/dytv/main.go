@@ -389,9 +389,6 @@ func handleDouyuRecPlaylist(w http.ResponseWriter, r *http.Request) {
 	playlist.WriteString("#EXTM3U\n")
 
 	for _, item := range items {
-		if item.ShowStatus != 1 {
-			continue
-		}
 		roomID := strconv.Itoa(item.BizID)
 		proxyURL := fmt.Sprintf("%s/live/douyu/%s", baseURL, roomID)
 		// 过滤换行符防止 M3U 内容注入
@@ -450,9 +447,6 @@ func handleDouyuFollowPlaylist(w http.ResponseWriter, r *http.Request) {
 	playlist.WriteString("#EXTM3U\n")
 
 	for _, room := range rooms {
-		if room.ShowStatus != 1 {
-			continue
-		}
 		roomID := strconv.Itoa(room.RoomID)
 		proxyURL := fmt.Sprintf("%s/live/douyu/%s", baseURL, roomID)
 		name := room.Nickname
@@ -460,7 +454,7 @@ func handleDouyuFollowPlaylist(w http.ResponseWriter, r *http.Request) {
 			name = room.RoomName
 		}
 		name = strings.NewReplacer("\n", "", "\r", "").Replace(name)
-		logo := room.RoomSrc
+		logo := strings.TrimSuffix(room.RoomSrc, "/dy1")
 		if logo == "" {
 			logo = room.AvatarSmall
 		}
