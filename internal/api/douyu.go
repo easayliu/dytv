@@ -23,7 +23,8 @@ const (
 	DouyuBetardAPI    = "https://www.douyu.com/betard/%s"
 	DouyuSwfAPI       = "https://www.douyu.com/swf_api/homeH5Enc?rids=%s"
 	DouyuOpenAPI      = "https://open.douyucdn.cn/api/RoomApi/room/%s"
-	DouyuSearchRecAPI = "https://www.douyu.com/wgapi/livenc/search/searchWordRec"
+	DouyuSearchRecAPI  = "https://www.douyu.com/wgapi/livenc/search/searchWordRec"
+	DouyuFollowListAPI = "https://www.douyu.com/wgapi/livenc/liveweb/follow/list"
 )
 
 type DouyuClient struct {
@@ -423,6 +424,46 @@ func (c *DouyuClient) SearchRecommend(cookie string) ([]DouyuSearchRecItem, erro
 
 	if resp.Error != 0 {
 		return nil, fmt.Errorf("search recommend API error: %d", resp.Error)
+	}
+
+	return resp.Data.List, nil
+}
+
+// DouyuFollowRoom represents a room in the follow list.
+type DouyuFollowRoom struct {
+	RoomID      int    `json:"room_id"`
+	RoomName    string `json:"room_name"`
+	Nickname    string `json:"nickname"`
+	GameName    string `json:"game_name"`
+	ShowStatus  int    `json:"show_status"` // 1=在线, 2=离线
+	Online      string `json:"online"`
+	RoomSrc     string `json:"room_src"`
+	AvatarSmall string `json:"avatar_small"`
+}
+
+// FollowList fetches the user's followed rooms from Douyu.
+func (c *DouyuClient) FollowList(cookie string) ([]DouyuFollowRoom, error) {
+	headers := map[string]string{
+		"Cookie": cookie,
+	}
+
+	body, err := c.httpClient.GetWithHeaders(DouyuFollowListAPI, headers)
+	if err != nil {
+		return nil, fmt.Errorf("follow list request failed: %w", err)
+	}
+
+	var resp struct {
+		Error int    `json:"error"`
+		Msg   string `json:"msg"`
+		Data  struct {
+			List []DouyuFollowRoom `json:"list"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("parse follow list response: %w", err)
+	}
+	if resp.Error != 0 {
+		return nil, fmt.Errorf("follow list API error(%d): %s", resp.Error, resp.Msg)
 	}
 
 	return resp.Data.List, nil

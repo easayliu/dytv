@@ -108,6 +108,13 @@ launchctl unload ~/Library/LaunchAgents/com.dytv.plist  # Stop
 | `GET /playlist.m3u?rooms=1,2,3&platform=douyu` | Generate M3U playlist (Douyu) |
 | `GET /playlist.m3u?rooms=1,2,3&platform=bilibili` | Generate M3U playlist (Bilibili) |
 | `GET /playlist/douyu/rec.m3u` | Douyu recommended rooms playlist |
+| `GET /playlist/douyu/follow.m3u` | Douyu followed rooms playlist (requires cookie) |
+
+### Login (登录)
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /login` | Douyu QR code login page |
 
 ### Health
 
@@ -115,11 +122,23 @@ launchctl unload ~/Library/LaunchAgents/com.dytv.plist  # Stop
 |----------|-------------|
 | `GET /health` | Health check |
 
-## Douyu Recommended Playlist
+## Douyu Login & Cookie
 
-通过斗鱼搜索推荐 API 自动发现在线直播间并生成 M3U 播放列表。
+### 扫码登录（推荐）
 
-### Cookie 配置
+访问 `http://localhost:8080/login`，用斗鱼 APP 扫码登录，cookie 自动保存到 `~/.config/dytv/cookie`。
+
+适合无浏览器的服务器——从任意设备的浏览器访问即可完成登录。
+
+### Cookie 优先级
+
+请求需要 cookie 的端点（`rec.m3u`、`follow.m3u`）时，按以下顺序查找：
+
+1. 请求头 `X-Douyu-Cookie`
+2. 环境变量 `DOUYU_COOKIE`
+3. 文件 `~/.config/dytv/cookie`（扫码登录自动保存）
+
+### 手动配置 Cookie
 
 ```bash
 # 方式 1: 安装时设置
@@ -135,11 +154,14 @@ DOUYU_COOKIE='your_cookie' dytv
 ### 请求方式
 
 ```bash
-# 使用环境变量中的 cookie
+# 关注列表（使用已保存的 cookie）
+curl http://localhost:8080/playlist/douyu/follow.m3u
+
+# 搜索推荐
 curl http://localhost:8080/playlist/douyu/rec.m3u
 
 # 使用请求头传入 cookie
-curl -H "X-Douyu-Cookie: your_cookie" http://localhost:8080/playlist/douyu/rec.m3u
+curl -H "X-Douyu-Cookie: your_cookie" http://localhost:8080/playlist/douyu/follow.m3u
 ```
 
 ## Change Port

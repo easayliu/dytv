@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -13,7 +14,9 @@ import (
 	"time"
 
 	"github.com/easayliu/dytv/internal/api"
+	"github.com/easayliu/dytv/internal/config"
 	"github.com/easayliu/dytv/internal/model"
+	qrcode "github.com/skip2/go-qrcode"
 )
 
 var (
@@ -36,8 +39,14 @@ func main() {
 	// Bilibili routes
 	mux.HandleFunc("/live/bilibili/", handleBilibiliLive)
 
+	// Login routes
+	mux.HandleFunc("/login/qrcode", handleLoginQRCode)
+	mux.HandleFunc("/login/poll", handleLoginPoll)
+	mux.HandleFunc("/login", handleLoginPage)
+
 	mux.HandleFunc("/playlist.m3u", handlePlaylist)
 	mux.HandleFunc("/playlist/douyu/rec.m3u", handleDouyuRecPlaylist)
+	mux.HandleFunc("/playlist/douyu/follow.m3u", handleDouyuFollowPlaylist)
 	mux.HandleFunc("/health", handleHealth)
 
 	addr := ":" + port
@@ -62,7 +71,10 @@ func main() {
 	fmt.Println("  Playlist:")
 	fmt.Println("    GET /playlist.m3u?rooms=1,2,3&platform=douyu   - Generate M3U playlist")
 	fmt.Println("    GET /playlist.m3u?rooms=1,2,3&platform=bilibili")
-	fmt.Println("    GET /playlist/douyu/rec.m3u                    - Douyu recommended rooms playlist (header: X-Douyu-Cookie or env: DOUYU_COOKIE)")
+	fmt.Println("    GET /playlist/douyu/rec.m3u                    - Douyu recommended rooms playlist")
+	fmt.Println("    GET /playlist/douyu/follow.m3u                 - Douyu followed rooms playlist")
+	fmt.Println("  Login (登录):")
+	fmt.Println("    GET /login                       - Douyu QR code login page")
 	fmt.Println("  Health:")
 	fmt.Println("    GET /health                      - Health check")
 	fmt.Println()
@@ -346,7 +358,12 @@ func handleDouyuRecPlaylist(w http.ResponseWriter, r *http.Request) {
 		cookie = os.Getenv("DOUYU_COOKIE")
 	}
 	if cookie == "" {
-		http.Error(w, "cookie is required (X-Douyu-Cookie header or DOUYU_COOKIE env)", http.StatusBadRequest)
+		if saved, err := config.LoadCookie(); err == nil && saved != "" {
+			cookie = saved
+		}
+	}
+	if cookie == "" {
+		http.Error(w, "cookie is required (X-Douyu-Cookie header, DOUYU_COOKIE env, or login via /login)", http.StatusBadRequest)
 		return
 	}
 
@@ -387,3 +404,250 @@ func handleDouyuRecPlaylist(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", `attachment; filename="douyu_rec.m3u"`)
 	_, _ = w.Write([]byte(playlist.String()))
 }
+
+func handleDouyuFollowPlaylist(w http.ResponseWriter, r *http.Request) {
+	cookie := r.Header.Get("X-Douyu-Cookie")
+	if cookie == "" {
+		cookie = os.Getenv("DOUYU_COOKIE")
+	}
+	if cookie == "" {
+		if saved, err := config.LoadCookie(); err == nil && saved != "" {
+			cookie = saved
+		}
+	}
+	if cookie == "" {
+		http.Error(w, "cookie is required (X-Douyu-Cookie header, DOUYU_COOKIE env, or login via /login)", http.StatusBadRequest)
+		return
+	}
+
+	rooms, err := douyuClient.FollowList(cookie)
+	if err != nil {
+		http.Error(w, "failed to get follow list: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	online := 0
+	for _, r := range rooms {
+		if r.ShowStatus == 1 {
+			online++
+		}
+	}
+	fmt.Printf("[follow] total=%d online=%d\n", len(rooms), online)
+
+	baseURL := r.URL.Query().Get("base_url")
+	if baseURL == "" {
+		scheme := "http"
+		if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+			scheme = proto
+		} else if r.TLS != nil {
+			scheme = "https"
+		}
+		baseURL = fmt.Sprintf("%s://%s", scheme, r.Host)
+	}
+	baseURL = strings.TrimSuffix(baseURL, "/")
+
+	var playlist strings.Builder
+	playlist.WriteString("#EXTM3U\n")
+
+	for _, room := range rooms {
+		if room.ShowStatus != 1 {
+			continue
+		}
+		roomID := strconv.Itoa(room.RoomID)
+		proxyURL := fmt.Sprintf("%s/live/douyu/%s", baseURL, roomID)
+		name := room.Nickname
+		if room.RoomName != "" {
+			name = room.RoomName
+		}
+		name = strings.NewReplacer("\n", "", "\r", "").Replace(name)
+		logo := room.RoomSrc
+		if logo == "" {
+			logo = room.AvatarSmall
+		}
+		if logo != "" {
+			playlist.WriteString(fmt.Sprintf("#EXTINF:-1 tvg-logo=\"%s\",%s\n", logo, name))
+		} else {
+			playlist.WriteString(fmt.Sprintf("#EXTINF:-1,%s\n", name))
+		}
+		playlist.WriteString(proxyURL + "\n")
+	}
+
+	w.Header().Set("Content-Type", "audio/x-mpegurl")
+	w.Header().Set("Content-Disposition", `attachment; filename="douyu_follow.m3u"`)
+	_, _ = w.Write([]byte(playlist.String()))
+}
+
+// handleLoginPage serves the QR code login HTML page.
+func handleLoginPage(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(loginHTML))
+}
+
+// handleLoginQRCode generates a new QR code for login.
+func handleLoginQRCode(w http.ResponseWriter, r *http.Request) {
+	result, err := api.GenerateQRCode()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": err.Error(),
+		})
+		return
+	}
+
+	png, err := qrcode.Encode(result.URL, qrcode.Medium, 256)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": "failed to generate qrcode image",
+		})
+		return
+	}
+
+	image := "data:image/png;base64," + base64.StdEncoding.EncodeToString(png)
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"code":   result.Code,
+		"image":  image,
+		"expire": result.Expire,
+	})
+}
+
+// handleLoginPoll polls the QR code scan status.
+func handleLoginPoll(w http.ResponseWriter, r *http.Request) {
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"status": "error", "message": "code parameter is required",
+		})
+		return
+	}
+
+	status, err := api.CheckQRStatus(code)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"status": "error", "message": err.Error(),
+		})
+		return
+	}
+
+	if status.Status == "success" && status.URL != "" {
+		cookie, err := api.DoLoginCallback(status.URL)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"status": "error", "message": "login callback failed: " + err.Error(),
+			})
+			return
+		}
+		if err := config.SaveCookie(cookie); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{
+				"status": "error", "message": "failed to save cookie: " + err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{
+			"status": "success", "message": "登录成功，cookie 已保存",
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status": status.Status, "message": status.Message,
+	})
+}
+
+func writeJSON(w http.ResponseWriter, code int, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+const loginHTML = `<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>斗鱼扫码登录 - dytv</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+display:flex;justify-content:center;align-items:center;min-height:100vh;
+background:#f5f5f5;color:#333}
+@media(prefers-color-scheme:dark){
+body{background:#1a1a1a;color:#e0e0e0}
+.card{background:#2a2a2a;box-shadow:0 2px 12px rgba(0,0,0,.4)}
+}
+.card{background:#fff;border-radius:12px;padding:32px;text-align:center;
+box-shadow:0 2px 12px rgba(0,0,0,.1);max-width:360px;width:90%}
+h1{font-size:20px;margin-bottom:8px}
+.subtitle{font-size:14px;color:#888;margin-bottom:24px}
+#qr-img{width:256px;height:256px;margin:0 auto 16px;border-radius:8px;
+display:block;image-rendering:pixelated}
+#status{font-size:15px;min-height:24px;margin-bottom:16px}
+.btn{display:inline-block;padding:10px 24px;border:none;border-radius:6px;
+background:#ff5d23;color:#fff;font-size:15px;cursor:pointer}
+.btn:hover{background:#e64d18}
+.hidden{display:none}
+.success{color:#52c41a}
+.scanned{color:#1890ff}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>斗鱼扫码登录</h1>
+<p class="subtitle">使用斗鱼 APP 扫描二维码</p>
+<img id="qr-img" class="hidden" alt="QR Code">
+<div id="loading">加载中...</div>
+<p id="status"></p>
+<button id="refresh-btn" class="btn hidden" onclick="fetchQR()">重新生成</button>
+</div>
+<script>
+let pollTimer=null,currentCode="";
+async function fetchQR(){
+  clearInterval(pollTimer);
+  document.getElementById("loading").textContent="加载中...";
+  document.getElementById("loading").classList.remove("hidden");
+  document.getElementById("qr-img").classList.add("hidden");
+  document.getElementById("refresh-btn").classList.add("hidden");
+  document.getElementById("status").textContent="";
+  document.getElementById("status").className="";
+  try{
+    const r=await fetch("/login/qrcode");
+    const d=await r.json();
+    if(d.error){document.getElementById("loading").textContent="错误: "+d.error;return}
+    currentCode=d.code;
+    document.getElementById("qr-img").src=d.image;
+    document.getElementById("qr-img").classList.remove("hidden");
+    document.getElementById("loading").classList.add("hidden");
+    document.getElementById("status").textContent="等待扫码...";
+    pollTimer=setInterval(pollStatus,3000);
+  }catch(e){document.getElementById("loading").textContent="请求失败，请刷新页面"}
+}
+async function pollStatus(){
+  try{
+    const r=await fetch("/login/poll?code="+encodeURIComponent(currentCode));
+    const d=await r.json();
+    const st=document.getElementById("status");
+    console.log("poll:",d);
+    if(d.status==="success"){
+      clearInterval(pollTimer);
+      st.textContent=d.message;
+      st.className="success";
+      document.getElementById("qr-img").style.opacity="0.3";
+    }else if(d.status==="scanned"){
+      st.textContent=d.message;
+      st.className="scanned";
+    }else if(d.status==="expired"){
+      clearInterval(pollTimer);
+      st.textContent=d.message;
+      st.className="";
+      document.getElementById("refresh-btn").classList.remove("hidden");
+    }else if(d.status==="error"){
+      st.textContent=d.message;
+      st.className="";
+    }else{
+      st.textContent=d.message||"等待扫码...";
+    }
+  }catch(e){console.error("poll error:",e)}
+}
+fetchQR();
+</script>
+</body>
+</html>`
