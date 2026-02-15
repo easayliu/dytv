@@ -100,6 +100,11 @@ install_systemd() {
         return
     fi
 
+    log "Creating config directory /etc/dytv..."
+    sudo mkdir -p /etc/dytv
+    sudo chown nobody:nogroup /etc/dytv
+    sudo chmod 700 /etc/dytv
+
     log "Creating systemd service (port: ${PORT})..."
     sudo tee /etc/systemd/system/${SERVICE_NAME}.service > /dev/null <<EOF
 [Unit]
@@ -111,6 +116,7 @@ Type=simple
 User=nobody
 Environment=PORT=${PORT}
 Environment=DOUYU_COOKIE=${DOUYU_COOKIE}
+Environment=DYTV_CONFIG_DIR=/etc/dytv
 ExecStart=${INSTALL_DIR}/${APP_NAME}
 Restart=always
 RestartSec=5
@@ -184,6 +190,12 @@ uninstall() {
         launchctl unload "${PLIST_PATH}" 2>/dev/null || true
         rm -f "${PLIST_PATH}"
         log "Removed launchd service"
+    fi
+
+    # Remove config directory
+    if [[ -d /etc/dytv ]]; then
+        sudo rm -rf /etc/dytv
+        log "Removed /etc/dytv"
     fi
 
     # Remove binary
