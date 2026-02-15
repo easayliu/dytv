@@ -21,6 +21,17 @@ log() { echo -e "${GREEN}[INFO]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
+is_service_active() {
+    if [[ -f /etc/systemd/system/${SERVICE_NAME}.service ]]; then
+        systemctl is-active --quiet ${SERVICE_NAME} 2>/dev/null && return 0
+    fi
+    PLIST_PATH="$HOME/Library/LaunchAgents/com.dytv.plist"
+    if [[ -f "${PLIST_PATH}" ]]; then
+        launchctl list 2>/dev/null | grep -q "com.dytv" && return 0
+    fi
+    return 1
+}
+
 detect_platform() {
     OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
     ARCH="$(uname -m)"
@@ -68,10 +79,22 @@ download_binary() {
 }
 
 install_binary() {
+    local was_active=false
+    if is_service_active; then
+        was_active=true
+        log "Service is running, stopping before binary replacement..."
+        stop_service
+    fi
+
     log "Installing to ${INSTALL_DIR}..."
     sudo mv "${TMP_FILE}" "${INSTALL_DIR}/${APP_NAME}"
     sudo chmod +x "${INSTALL_DIR}/${APP_NAME}"
     log "Installed to ${INSTALL_DIR}/${APP_NAME}"
+
+    if [[ "${was_active}" == true ]]; then
+        log "Restarting service with new binary..."
+        start_service
+    fi
 }
 
 check_go() {
@@ -105,8 +128,31 @@ install_systemd() {
     sudo chown nobody:nogroup /etc/dytv
     sudo chmod 700 /etc/dytv
 
-    log "Creating systemd service (port: ${PORT})..."
-    sudo tee /etc/systemd/system/${SERVICE_NAME}.service > /dev/null <<EOF
+    local service_file="/etc/systemd/system/${SERVICE_NAME}.service"
+    local effective_port="${PORT}"
+    local effective_cookie="${DOUYU_COOKIE}"
+
+    # 覆盖安装时保留已有配置（除非用户显式指定了新值）
+    if [[ -f "${service_file}" ]]; then
+        log "Existing service file found, preserving configuration..."
+        if [[ "${PORT}" == "8080" && -z "${DYTV_PORT_SET:-}" ]]; then
+            local existing_port
+            existing_port=$(grep -oP 'Environment=PORT=\K.*' "${service_file}" 2>/dev/null || echo "")
+            if [[ -n "${existing_port}" ]]; then
+                effective_port="${existing_port}"
+            fi
+        fi
+        if [[ -z "${DOUYU_COOKIE}" ]]; then
+            local existing_cookie
+            existing_cookie=$(grep -oP 'Environment=DOUYU_COOKIE=\K.*' "${service_file}" 2>/dev/null || echo "")
+            if [[ -n "${existing_cookie}" ]]; then
+                effective_cookie="${existing_cookie}"
+            fi
+        fi
+    fi
+
+    log "Creating systemd service (port: ${effective_port})..."
+    sudo tee "${service_file}" > /dev/null <<EOF
 [Unit]
 Description=Live Stream URL Service
 After=network.target
@@ -114,8 +160,8 @@ After=network.target
 [Service]
 Type=simple
 User=nobody
-Environment=PORT=${PORT}
-Environment=DOUYU_COOKIE=${DOUYU_COOKIE}
+Environment=PORT=${effective_port}
+Environment=DOUYU_COOKIE=${effective_cookie}
 Environment=DYTV_CONFIG_DIR=/etc/dytv
 ExecStart=${INSTALL_DIR}/${APP_NAME}
 Restart=always
@@ -127,8 +173,8 @@ EOF
 
     sudo systemctl daemon-reload
     sudo systemctl enable ${SERVICE_NAME}
-    sudo systemctl start ${SERVICE_NAME}
-    log "Service created and started: ${SERVICE_NAME}"
+    sudo systemctl restart ${SERVICE_NAME}
+    log "Service started: ${SERVICE_NAME}"
     log "Status: sudo systemctl status ${SERVICE_NAME}"
 }
 
@@ -137,10 +183,35 @@ install_launchd() {
         return
     fi
 
-    log "Creating launchd service (port: ${PORT})..."
     PLIST_PATH="$HOME/Library/LaunchAgents/com.dytv.plist"
     mkdir -p "$HOME/Library/LaunchAgents"
 
+    local effective_port="${PORT}"
+    local effective_cookie="${DOUYU_COOKIE}"
+    local config_dir="$HOME/.config/dytv"
+
+    # 覆盖安装时保留已有配置（除非用户显式指定了新值）
+    if [[ -f "${PLIST_PATH}" ]]; then
+        log "Existing plist found, preserving configuration..."
+        launchctl unload "${PLIST_PATH}" 2>/dev/null || true
+
+        if [[ "${PORT}" == "8080" && -z "${DYTV_PORT_SET:-}" ]]; then
+            local existing_port
+            existing_port=$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:PORT" "${PLIST_PATH}" 2>/dev/null || echo "")
+            if [[ -n "${existing_port}" ]]; then
+                effective_port="${existing_port}"
+            fi
+        fi
+        if [[ -z "${DOUYU_COOKIE}" ]]; then
+            local existing_cookie
+            existing_cookie=$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:DOUYU_COOKIE" "${PLIST_PATH}" 2>/dev/null || echo "")
+            if [[ -n "${existing_cookie}" ]]; then
+                effective_cookie="${existing_cookie}"
+            fi
+        fi
+    fi
+
+    log "Creating launchd service (port: ${effective_port})..."
     cat > "${PLIST_PATH}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -155,9 +226,11 @@ install_launchd() {
     <key>EnvironmentVariables</key>
     <dict>
         <key>PORT</key>
-        <string>${PORT}</string>
+        <string>${effective_port}</string>
         <key>DOUYU_COOKIE</key>
-        <string>${DOUYU_COOKIE}</string>
+        <string>${effective_cookie}</string>
+        <key>DYTV_CONFIG_DIR</key>
+        <string>${config_dir}</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -168,7 +241,7 @@ install_launchd() {
 EOF
 
     launchctl load "${PLIST_PATH}"
-    log "Service created and started: ${PLIST_PATH}"
+    log "Service started: ${PLIST_PATH}"
     log "Status: launchctl list | grep dytv"
 }
 
@@ -337,6 +410,7 @@ Commands:
   install-source   Build from source and install
   service          Download, install, create and start system service
   service-source   Build from source, install, create and start system service
+  upgrade          Upgrade binary and restart service (preserves config)
   uninstall        Remove binary and service
   start            Start the service
   stop             Stop the service
@@ -376,6 +450,9 @@ Examples:
   # Update cookie
   $0 set-cookie 'your_cookie_value'
 
+  # Upgrade to latest version (preserves config)
+  $0 upgrade
+
   # Uninstall
   $0 uninstall
 EOF
@@ -409,6 +486,17 @@ case "${1:-}" in
             install_systemd
         fi
         log "Service is running at http://localhost:${PORT}"
+        ;;
+    upgrade)
+        log "Upgrading ${APP_NAME}..."
+        download_binary
+        install_binary
+        if [[ "$(uname)" == "Darwin" ]]; then
+            install_launchd
+        else
+            install_systemd
+        fi
+        log "Upgrade complete! Service is running at http://localhost:${PORT}"
         ;;
     uninstall)
         uninstall
