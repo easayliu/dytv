@@ -7,6 +7,7 @@ INSTALL_DIR="/usr/local/bin"
 SERVICE_NAME="dytv"
 PORT="${PORT:-8080}"
 VERSION="${VERSION:-latest}"
+DOUYU_COOKIE="${DOUYU_COOKIE:-}"
 
 # GitHub repository
 GITHUB_REPO="${GITHUB_REPO:-easayliu/dytv}"
@@ -109,6 +110,7 @@ After=network.target
 Type=simple
 User=nobody
 Environment=PORT=${PORT}
+Environment=DOUYU_COOKIE=${DOUYU_COOKIE}
 ExecStart=${INSTALL_DIR}/${APP_NAME}
 Restart=always
 RestartSec=5
@@ -148,6 +150,8 @@ install_launchd() {
     <dict>
         <key>PORT</key>
         <string>${PORT}</string>
+        <key>DOUYU_COOKIE</key>
+        <string>${DOUYU_COOKIE}</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -210,6 +214,50 @@ update_port() {
         launchctl unload "${PLIST_PATH}" 2>/dev/null || true
         launchctl load "${PLIST_PATH}"
         log "Updated launchd service port to ${new_port}"
+    fi
+}
+
+update_cookie() {
+    local new_cookie="$1"
+    if [[ -z "${new_cookie}" ]]; then
+        error "Please specify a cookie value"
+    fi
+
+    local service_file="/etc/systemd/system/${SERVICE_NAME}.service"
+    if [[ -f "${service_file}" ]]; then
+        # 使用 awk 安全替换，避免 cookie 中特殊字符破坏 sed
+        local tmp_file
+        tmp_file="$(mktemp)"
+        if grep -q "Environment=DOUYU_COOKIE=" "${service_file}"; then
+            sudo awk -v cookie="${new_cookie}" '{
+                if ($0 ~ /^Environment=DOUYU_COOKIE=/) print "Environment=DOUYU_COOKIE=" cookie;
+                else print
+            }' "${service_file}" > "${tmp_file}" && sudo mv "${tmp_file}" "${service_file}"
+        else
+            sudo awk -v cookie="${new_cookie}" '{
+                print;
+                if ($0 ~ /^\[Service\]/) print "Environment=DOUYU_COOKIE=" cookie
+            }' "${service_file}" > "${tmp_file}" && sudo mv "${tmp_file}" "${service_file}"
+        fi
+        sudo systemctl daemon-reload
+        sudo systemctl restart ${SERVICE_NAME}
+        log "Updated DOUYU_COOKIE and restarted service"
+    fi
+
+    PLIST_PATH="$HOME/Library/LaunchAgents/com.dytv.plist"
+    if [[ -f "${PLIST_PATH}" ]]; then
+        # 使用 python3 安全操作 plist，避免 sed 特殊字符问题
+        python3 -c "
+import plistlib, sys
+with open('${PLIST_PATH}', 'rb') as f:
+    pl = plistlib.load(f)
+pl.setdefault('EnvironmentVariables', {})['DOUYU_COOKIE'] = sys.argv[1]
+with open('${PLIST_PATH}', 'wb') as f:
+    plistlib.dump(pl, f)
+" "${new_cookie}"
+        launchctl unload "${PLIST_PATH}" 2>/dev/null || true
+        launchctl load "${PLIST_PATH}"
+        log "Updated DOUYU_COOKIE and restarted service"
     fi
 }
 
@@ -282,12 +330,14 @@ Commands:
   stop             Stop the service
   restart          Restart the service
   status           Show service status
-  set-port <port>  Update service port and restart
+  set-port <port>      Update service port and restart
+  set-cookie <cookie>  Update DOUYU_COOKIE and restart
 
 Environment Variables:
   PORT             Server port (default: 8080)
   VERSION          Release version (default: latest)
   GITHUB_REPO      GitHub repository (default: easayliu/dytv)
+  DOUYU_COOKIE     Douyu cookie for search recommend API
 
 Examples:
   # Install latest release
@@ -296,8 +346,8 @@ Examples:
   # Install specific version
   VERSION=v1.0.0 $0 install
 
-  # Install and start service on port 9000
-  PORT=9000 $0 service
+  # Install and start service on port 9000 with cookie
+  PORT=9000 DOUYU_COOKIE='your_cookie' $0 service
 
   # Build from source and install
   $0 install-source
@@ -310,6 +360,9 @@ Examples:
 
   # Change service port
   $0 set-port 9000
+
+  # Update cookie
+  $0 set-cookie 'your_cookie_value'
 
   # Uninstall
   $0 uninstall
@@ -362,6 +415,9 @@ case "${1:-}" in
         ;;
     set-port)
         update_port "$2"
+        ;;
+    set-cookie)
+        update_cookie "$2"
         ;;
     *)
         usage

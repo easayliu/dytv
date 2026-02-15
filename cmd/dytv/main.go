@@ -1,14 +1,24 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
+	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/easayliu/dytv/internal/api"
 	"github.com/easayliu/dytv/internal/model"
+)
+
+var (
+	douyuClient    = api.NewDouyuClient()
+	bilibiliClient = api.NewBilibiliClient()
 )
 
 func main() {
@@ -17,17 +27,27 @@ func main() {
 		port = "8080"
 	}
 
+	mux := http.NewServeMux()
+
 	// Douyu routes (default platform)
-	http.HandleFunc("/live/douyu/", handleDouyuLive)
-	http.HandleFunc("/live/", handleLive) // Default to Douyu for backward compatibility
+	mux.HandleFunc("/live/douyu/", handleDouyuLive)
+	mux.HandleFunc("/live/", handleLive) // Default to Douyu for backward compatibility
 
 	// Bilibili routes
-	http.HandleFunc("/live/bilibili/", handleBilibiliLive)
+	mux.HandleFunc("/live/bilibili/", handleBilibiliLive)
 
-	http.HandleFunc("/playlist.m3u", handlePlaylist)
-	http.HandleFunc("/health", handleHealth)
+	mux.HandleFunc("/playlist.m3u", handlePlaylist)
+	mux.HandleFunc("/playlist/douyu/rec.m3u", handleDouyuRecPlaylist)
+	mux.HandleFunc("/health", handleHealth)
 
 	addr := ":" + port
+	srv := &http.Server{
+		Addr:         addr,
+		Handler:      mux,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 60 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
 	fmt.Printf("Starting server on %s\n", addr)
 	fmt.Println("Endpoints:")
 	fmt.Println("  Douyu (斗鱼):")
@@ -42,25 +62,40 @@ func main() {
 	fmt.Println("  Playlist:")
 	fmt.Println("    GET /playlist.m3u?rooms=1,2,3&platform=douyu   - Generate M3U playlist")
 	fmt.Println("    GET /playlist.m3u?rooms=1,2,3&platform=bilibili")
+	fmt.Println("    GET /playlist/douyu/rec.m3u                    - Douyu recommended rooms playlist (header: X-Douyu-Cookie or env: DOUYU_COOKIE)")
 	fmt.Println("  Health:")
 	fmt.Println("    GET /health                      - Health check")
 	fmt.Println()
 
-	if err := http.ListenAndServe(addr, nil); err != nil {
-		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
+	// Graceful shutdown
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
+			os.Exit(1)
+		}
+	}()
+
+	<-quit
+	fmt.Println("\nShutting down server...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "Server forced to shutdown: %v\n", err)
 		os.Exit(1)
 	}
+
+	fmt.Println("Server stopped")
 }
 
 // handleLive handles default live requests (backward compatible, defaults to Douyu)
 func handleLive(w http.ResponseWriter, r *http.Request) {
+	// 提取 roomID 后委托给斗鱼 handler
 	path := strings.TrimPrefix(r.URL.Path, "/live/")
-
-	// Check if it's a platform-specific route (handled by other handlers)
-	if strings.HasPrefix(path, "douyu/") || strings.HasPrefix(path, "bilibili/") {
-		return
-	}
-
 	roomID := strings.TrimSuffix(path, "/")
 
 	if roomID == "" {
@@ -68,42 +103,7 @@ func handleLive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rate := 0
-	if rateStr := r.URL.Query().Get("rate"); rateStr != "" {
-		fmt.Sscanf(rateStr, "%d", &rate)
-	} else if q := r.URL.Query().Get("quality"); q != "" {
-		if rateVal, ok := model.QualityMap[strings.ToLower(q)]; ok {
-			rate = rateVal
-		}
-	}
-
-	client := api.NewDouyuClient()
-	info, err := client.GetStreamURL(roomID, rate)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if !info.IsLive || info.StreamURL == "" {
-		http.Error(w, "room is offline", http.StatusNotFound)
-		return
-	}
-
-	format := strings.ToLower(r.URL.Query().Get("format"))
-	if format == "json" {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"room_id":    info.RoomID,
-			"platform":   "douyu",
-			"is_live":    info.IsLive,
-			"flv_url":    info.FlvURL,
-			"stream_url": info.StreamURL,
-			"multirates": info.Multirates,
-		})
-		return
-	}
-
-	http.Redirect(w, r, info.StreamURL, http.StatusFound)
+	serveDouyuStream(w, r, roomID)
 }
 
 // handleDouyuLive handles Douyu-specific live requests
@@ -116,6 +116,11 @@ func handleDouyuLive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	serveDouyuStream(w, r, roomID)
+}
+
+// serveDouyuStream is the shared logic for Douyu stream handlers
+func serveDouyuStream(w http.ResponseWriter, r *http.Request, roomID string) {
 	rate := 0
 	if rateStr := r.URL.Query().Get("rate"); rateStr != "" {
 		fmt.Sscanf(rateStr, "%d", &rate)
@@ -125,8 +130,7 @@ func handleDouyuLive(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	client := api.NewDouyuClient()
-	info, err := client.GetStreamURL(roomID, rate)
+	info, err := douyuClient.GetStreamURL(roomID, rate)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -176,8 +180,7 @@ func handleBilibiliLive(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	client := api.NewBilibiliClient()
-	info, err := client.GetStreamURL(roomID, qn)
+	info, err := bilibiliClient.GetStreamURL(roomID, qn)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -213,10 +216,6 @@ func handlePlaylist(w http.ResponseWriter, r *http.Request) {
 	}
 
 	roomIDs := strings.Split(roomsParam, ",")
-	if len(roomIDs) == 0 {
-		http.Error(w, "at least one room ID is required", http.StatusBadRequest)
-		return
-	}
 
 	// 获取平台参数，默认为 douyu
 	platform := strings.ToLower(r.URL.Query().Get("platform"))
@@ -228,7 +227,9 @@ func handlePlaylist(w http.ResponseWriter, r *http.Request) {
 	baseURL := r.URL.Query().Get("base_url")
 	if baseURL == "" {
 		scheme := "http"
-		if r.TLS != nil {
+		if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+			scheme = proto
+		} else if r.TLS != nil {
 			scheme = "https"
 		}
 		baseURL = fmt.Sprintf("%s://%s", scheme, r.Host)
@@ -255,14 +256,13 @@ func handlePlaylist(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		client := api.NewBilibiliClient()
 		for _, roomID := range roomIDs {
 			roomID = strings.TrimSpace(roomID)
 			if roomID == "" {
 				continue
 			}
 
-			info, err := client.GetStreamURL(roomID, qn)
+			info, err := bilibiliClient.GetStreamURL(roomID, qn)
 			if err != nil {
 				continue
 			}
@@ -298,14 +298,13 @@ func handlePlaylist(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		client := api.NewDouyuClient()
 		for _, roomID := range roomIDs {
 			roomID = strings.TrimSpace(roomID)
 			if roomID == "" {
 				continue
 			}
 
-			info, err := client.GetStreamURL(roomID, rate)
+			info, err := douyuClient.GetStreamURL(roomID, rate)
 			if err != nil {
 				continue
 			}
@@ -338,4 +337,53 @@ func handlePlaylist(w http.ResponseWriter, r *http.Request) {
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func handleDouyuRecPlaylist(w http.ResponseWriter, r *http.Request) {
+	// 优先从请求头获取 cookie，避免 URL 泄露凭据
+	cookie := r.Header.Get("X-Douyu-Cookie")
+	if cookie == "" {
+		cookie = os.Getenv("DOUYU_COOKIE")
+	}
+	if cookie == "" {
+		http.Error(w, "cookie is required (X-Douyu-Cookie header or DOUYU_COOKIE env)", http.StatusBadRequest)
+		return
+	}
+
+	items, err := douyuClient.SearchRecommend(cookie)
+	if err != nil {
+		http.Error(w, "failed to get recommendations", http.StatusInternalServerError)
+		return
+	}
+
+	baseURL := r.URL.Query().Get("base_url")
+	if baseURL == "" {
+		scheme := "http"
+		if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+			scheme = proto
+		} else if r.TLS != nil {
+			scheme = "https"
+		}
+		baseURL = fmt.Sprintf("%s://%s", scheme, r.Host)
+	}
+	baseURL = strings.TrimSuffix(baseURL, "/")
+
+	var playlist strings.Builder
+	playlist.WriteString("#EXTM3U\n")
+
+	for _, item := range items {
+		if item.ShowStatus != 1 {
+			continue
+		}
+		roomID := strconv.Itoa(item.BizID)
+		proxyURL := fmt.Sprintf("%s/live/douyu/%s", baseURL, roomID)
+		// 过滤换行符防止 M3U 内容注入
+		name := strings.NewReplacer("\n", "", "\r", "").Replace(item.Keyword)
+		playlist.WriteString(fmt.Sprintf("#EXTINF:-1,%s\n", name))
+		playlist.WriteString(proxyURL + "\n")
+	}
+
+	w.Header().Set("Content-Type", "audio/x-mpegurl")
+	w.Header().Set("Content-Disposition", `attachment; filename="douyu_rec.m3u"`)
+	_, _ = w.Write([]byte(playlist.String()))
 }

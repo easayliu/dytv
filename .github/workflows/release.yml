@@ -6,32 +6,8 @@ on:
       - 'v*'
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: Install UPX
-        run: sudo apt-get update && sudo apt-get install -y upx
-
-      - name: Build
-        run: |
-          CGO_ENABLED=0 go build -ldflags="-s -w" -o dytv ./cmd/dytv
-          upx --best --lzma dytv || true
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: dytv
-          path: dytv
-
   release:
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     steps:

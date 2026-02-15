@@ -1,8 +1,10 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -13,12 +15,15 @@ import (
 	"github.com/easayliu/dytv/internal/model"
 )
 
+var reDigitsOnly = regexp.MustCompile(`^\d+$`)
+
 const (
-	DouyuRoomURL   = "https://www.douyu.com/%s"
-	DouyuAPIURL    = "https://www.douyu.com/lapi/live/getH5Play/%s"
-	DouyuBetardAPI = "https://www.douyu.com/betard/%s"
-	DouyuSwfAPI    = "https://www.douyu.com/swf_api/homeH5Enc?rids=%s"
-	DouyuOpenAPI   = "https://open.douyucdn.cn/api/RoomApi/room/%s"
+	DouyuRoomURL      = "https://www.douyu.com/%s"
+	DouyuAPIURL       = "https://www.douyu.com/lapi/live/getH5Play/%s"
+	DouyuBetardAPI    = "https://www.douyu.com/betard/%s"
+	DouyuSwfAPI       = "https://www.douyu.com/swf_api/homeH5Enc?rids=%s"
+	DouyuOpenAPI      = "https://open.douyucdn.cn/api/RoomApi/room/%s"
+	DouyuSearchRecAPI = "https://www.douyu.com/wgapi/livenc/search/searchWordRec"
 )
 
 type DouyuClient struct {
@@ -38,8 +43,8 @@ func (c *DouyuClient) SetVerbose(verbose bool) {
 }
 
 func (c *DouyuClient) GetRealRoomID(roomID string) (string, error) {
-	url := fmt.Sprintf(DouyuRoomURL, roomID)
-	body, err := c.httpClient.Get(url)
+	roomURL := fmt.Sprintf(DouyuRoomURL, url.PathEscape(roomID))
+	body, err := c.httpClient.Get(roomURL)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch room page: %w", err)
 	}
@@ -102,7 +107,7 @@ func (c *DouyuClient) GetStreamURL(roomID string, rate int) (*model.RoomInfo, er
 	}
 
 	// Call the API
-	apiURL := fmt.Sprintf(DouyuAPIURL, realRoomID)
+	apiURL := fmt.Sprintf(DouyuAPIURL, url.PathEscape(realRoomID))
 	respBody, err := c.httpClient.Post(apiURL, reqData)
 	if err != nil {
 		return nil, fmt.Errorf("API request failed: %w", err)
@@ -156,7 +161,7 @@ func (c *DouyuClient) GetStreamURL(roomID string, rate int) (*model.RoomInfo, er
 }
 
 func (c *DouyuClient) getEncryptedJS(roomID string) (string, error) {
-	swfURL := fmt.Sprintf(DouyuSwfAPI, roomID)
+	swfURL := fmt.Sprintf(DouyuSwfAPI, url.QueryEscape(roomID))
 	body, err := c.httpClient.Get(swfURL)
 	if err != nil {
 		return "", fmt.Errorf("swf API request failed: %w", err)
@@ -184,7 +189,22 @@ func (c *DouyuClient) getEncryptedJS(roomID string) (string, error) {
 }
 
 func (c *DouyuClient) executeSigningJS(roomID string, jsCode string) (string, error) {
+	// 校验 roomID 只包含数字，防止 JS 注入
+	if !reDigitsOnly.MatchString(roomID) {
+		return "", fmt.Errorf("invalid room ID: %s", roomID)
+	}
+
 	vm := goja.New()
+
+	// 设置执行超时，防止恶意 JS 导致 goroutine 阻塞
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() {
+		<-ctx.Done()
+		if ctx.Err() == context.DeadlineExceeded {
+			vm.Interrupt("execution timeout")
+		}
+	}()
 
 	// Simple standalone MD5 implementation for CryptoJS compatibility
 	cryptoJSCode := `
@@ -344,8 +364,8 @@ var CryptoJS = {
 }
 
 func (c *DouyuClient) GetRoomStatus(roomID string) (bool, error) {
-	url := fmt.Sprintf(DouyuOpenAPI, roomID)
-	body, err := c.httpClient.Get(url)
+	openURL := fmt.Sprintf(DouyuOpenAPI, url.PathEscape(roomID))
+	body, err := c.httpClient.Get(openURL)
 	if err != nil {
 		return false, fmt.Errorf("failed to check room status: %w", err)
 	}
@@ -370,6 +390,42 @@ func (c *DouyuClient) ListQualities(roomID string) ([]model.StreamRate, error) {
 		return nil, err
 	}
 	return info.Multirates, nil
+}
+
+// DouyuSearchRecItem represents a recommended room from search API.
+type DouyuSearchRecItem struct {
+	Keyword    string `json:"kw"`
+	BizID      int    `json:"bizId"`
+	ShowStatus int    `json:"showStatus"`
+}
+
+// SearchRecommend fetches recommended live rooms from Douyu search API.
+func (c *DouyuClient) SearchRecommend(cookie string) ([]DouyuSearchRecItem, error) {
+	headers := map[string]string{
+		"Cookie": cookie,
+	}
+
+	body, err := c.httpClient.GetWithHeaders(DouyuSearchRecAPI, headers)
+	if err != nil {
+		return nil, fmt.Errorf("search recommend request failed: %w", err)
+	}
+
+	var resp struct {
+		Error int `json:"error"`
+		Data  struct {
+			List []DouyuSearchRecItem `json:"list"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse search recommend response: %w", err)
+	}
+
+	if resp.Error != 0 {
+		return nil, fmt.Errorf("search recommend API error: %d", resp.Error)
+	}
+
+	return resp.Data.List, nil
 }
 
 func ParseRoomID(input string) string {

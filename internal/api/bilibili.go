@@ -116,7 +116,7 @@ type bilibiliURLInfo struct {
 
 // GetRealRoomID resolves a short room ID to the real room ID
 func (c *BilibiliClient) GetRealRoomID(roomID string) (string, error) {
-	apiURL := fmt.Sprintf(BilibiliRoomInitAPI, roomID)
+	apiURL := fmt.Sprintf(BilibiliRoomInitAPI, url.QueryEscape(roomID))
 	body, err := c.httpClient.Get(apiURL)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch room init: %w", err)
@@ -281,7 +281,7 @@ func (c *BilibiliClient) GetRoomStatus(roomID string) (bool, error) {
 		return false, err
 	}
 
-	apiURL := fmt.Sprintf(BilibiliRoomInfoAPI, realRoomID)
+	apiURL := fmt.Sprintf(BilibiliRoomInfoAPI, url.QueryEscape(realRoomID))
 	body, err := c.httpClient.Get(apiURL)
 	if err != nil {
 		return false, fmt.Errorf("failed to fetch room info: %w", err)
