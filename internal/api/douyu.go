@@ -11,11 +11,15 @@ import (
 	"time"
 
 	"github.com/dop251/goja"
+	"github.com/easayliu/dytv/internal/cache"
 	"github.com/easayliu/dytv/internal/crypto"
 	"github.com/easayliu/dytv/internal/model"
 )
 
 var reDigitsOnly = regexp.MustCompile(`^\d+$`)
+
+// ErrRoomOffline is returned when the room is not currently streaming.
+var ErrRoomOffline = fmt.Errorf("room is offline")
 
 const (
 	DouyuRoomURL      = "https://www.douyu.com/%s"
@@ -28,15 +32,29 @@ const (
 )
 
 type DouyuClient struct {
-	httpClient *HTTPClient
-	verbose    bool
+	httpClient  *HTTPClient
+	verbose     bool
+	roomIDCache *cache.Cache[string]          // displayRoomID → realRoomID
+	jsCache     *cache.Cache[string]          // realRoomID → JS code
+	streamCache *cache.Cache[*model.RoomInfo] // roomID:rate → RoomInfo
 }
 
 func NewDouyuClient() *DouyuClient {
 	return &DouyuClient{
-		httpClient: NewHTTPClient(),
-		verbose:    false,
+		httpClient:  NewHTTPClient(),
+		verbose:     false,
+		roomIDCache: cache.New[string](24 * time.Hour),
+		jsCache:     cache.New[string](2 * time.Hour),
+		streamCache: cache.New[*model.RoomInfo](5 * time.Minute),
 	}
+}
+
+// StartCacheCleanup starts background goroutines to purge expired cache entries.
+// Close the stop channel to terminate the cleanup goroutines.
+func (c *DouyuClient) StartCacheCleanup(stop <-chan struct{}) {
+	c.roomIDCache.StartCleanup(1*time.Hour, stop)
+	c.jsCache.StartCleanup(30*time.Minute, stop)
+	c.streamCache.StartCleanup(1*time.Minute, stop)
 }
 
 func (c *DouyuClient) SetVerbose(verbose bool) {
@@ -70,7 +88,19 @@ func (c *DouyuClient) GetRealRoomID(roomID string) (string, error) {
 }
 
 func (c *DouyuClient) GetStreamURL(roomID string, rate int) (*model.RoomInfo, error) {
-	realRoomID, err := c.GetRealRoomID(roomID)
+	// Layer 1: stream URL cache (keyed by roomID:rate)
+	streamKey := fmt.Sprintf("%s:%d", roomID, rate)
+	return c.streamCache.GetOrLoad(streamKey, func() (*model.RoomInfo, error) {
+		return c.fetchStreamURL(roomID, rate)
+	})
+}
+
+// fetchStreamURL does the actual work of obtaining a stream URL (no caching).
+func (c *DouyuClient) fetchStreamURL(roomID string, rate int) (*model.RoomInfo, error) {
+	// Layer 2: room ID cache
+	realRoomID, err := c.roomIDCache.GetOrLoad(roomID, func() (string, error) {
+		return c.GetRealRoomID(roomID)
+	})
 	if err != nil {
 		if c.verbose {
 			fmt.Printf("Warning: failed to resolve real room ID: %v\n", err)
@@ -82,8 +112,10 @@ func (c *DouyuClient) GetStreamURL(roomID string, rate int) (*model.RoomInfo, er
 		fmt.Printf("Real room ID: %s\n", realRoomID)
 	}
 
-	// Get encrypted JS from swf_api
-	jsCode, err := c.getEncryptedJS(realRoomID)
+	// Layer 3: JS code cache
+	jsCode, err := c.jsCache.GetOrLoad(realRoomID, func() (string, error) {
+		return c.getEncryptedJS(realRoomID)
+	})
 	if err != nil {
 		if c.verbose {
 			fmt.Printf("Warning: failed to get encrypted JS: %v\n", err)
@@ -94,10 +126,20 @@ func (c *DouyuClient) GetStreamURL(roomID string, rate int) (*model.RoomInfo, er
 	// Execute JS to get sign params
 	signParams, err := c.executeSigningJS(realRoomID, jsCode)
 	if err != nil {
+		// JS execution failed — the cached JS may be stale. Clear and retry once.
 		if c.verbose {
-			fmt.Printf("Warning: JS execution failed: %v\n", err)
+			fmt.Printf("JS execution failed, clearing cache and retrying: %v\n", err)
 		}
-		return nil, fmt.Errorf("failed to execute signing: %w", err)
+		c.jsCache.Delete(realRoomID)
+		jsCode, err = c.getEncryptedJS(realRoomID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get signing function (retry): %w", err)
+		}
+		c.jsCache.Set(realRoomID, jsCode)
+		signParams, err = c.executeSigningJS(realRoomID, jsCode)
+		if err != nil {
+			return nil, fmt.Errorf("failed to execute signing (retry): %w", err)
+		}
 	}
 
 	// Build request data
@@ -135,11 +177,8 @@ func (c *DouyuClient) GetStreamURL(roomID string, rate int) (*model.RoomInfo, er
 			return nil, fmt.Errorf("failed to parse stream data: %w", err)
 		}
 	} else {
-		// Room is offline or no stream available
-		return &model.RoomInfo{
-			RoomID: realRoomID,
-			IsLive: false,
-		}, nil
+		// Room is offline or no stream available — return error so result is not cached
+		return nil, ErrRoomOffline
 	}
 
 	streamURL := ""
@@ -150,12 +189,16 @@ func (c *DouyuClient) GetStreamURL(roomID string, rate int) (*model.RoomInfo, er
 		flvURL = streamURL
 	}
 
+	if streamURL == "" {
+		return nil, ErrRoomOffline
+	}
+
 	roomInfo := &model.RoomInfo{
 		RoomID:     realRoomID,
 		StreamURL:  streamURL,
 		FlvURL:     flvURL,
 		Multirates: streamData.Multirates,
-		IsLive:     streamURL != "",
+		IsLive:     true,
 	}
 
 	return roomInfo, nil
