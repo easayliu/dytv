@@ -182,7 +182,7 @@ func serveDouyuStream(w http.ResponseWriter, r *http.Request, roomID string) {
 
 	if isM3U8 {
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-		w.Header().Set("Cache-Control", "max-age=60")
+		w.Header().Set("Cache-Control", "no-cache")
 		playlist := "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:600\n#EXTINF:-1,\n" + info.StreamURL + "\n"
 		_, _ = w.Write([]byte(playlist))
 		return
