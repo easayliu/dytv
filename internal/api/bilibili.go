@@ -7,9 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
-	"github.com/easayliu/dytv/internal/cache"
 	"github.com/easayliu/dytv/internal/model"
 )
 
@@ -21,10 +19,8 @@ const (
 
 // BilibiliClient handles Bilibili live stream API interactions
 type BilibiliClient struct {
-	httpClient  *HTTPClient
-	verbose     bool
-	roomIDCache *cache.Cache[string]          // displayRoomID → realRoomID
-	streamCache *cache.Cache[*model.RoomInfo] // roomID:qn → RoomInfo
+	httpClient *HTTPClient
+	verbose    bool
 }
 
 // NewBilibiliClient creates a new Bilibili API client
@@ -40,17 +36,9 @@ func NewBilibiliClient() *BilibiliClient {
 	}
 
 	return &BilibiliClient{
-		httpClient:  client,
-		verbose:     false,
-		roomIDCache: cache.New[string](24 * time.Hour),
-		streamCache: cache.New[*model.RoomInfo](5 * time.Minute),
+		httpClient: client,
+		verbose:    false,
 	}
-}
-
-// StartCacheCleanup starts background goroutines to purge expired cache entries.
-func (c *BilibiliClient) StartCacheCleanup(stop <-chan struct{}) {
-	c.roomIDCache.StartCleanup(1*time.Hour, stop)
-	c.streamCache.StartCleanup(1*time.Minute, stop)
 }
 
 // SetVerbose enables or disables verbose logging
@@ -152,23 +140,8 @@ func (c *BilibiliClient) GetRealRoomID(roomID string) (string, error) {
 
 // GetStreamURL fetches the stream URL for a Bilibili live room
 func (c *BilibiliClient) GetStreamURL(roomID string, qn int) (*model.RoomInfo, error) {
-	// Default to highest quality if not specified
-	if qn == 0 {
-		qn = 10000 // 原画
-	}
-
-	streamKey := fmt.Sprintf("%s:%d", roomID, qn)
-	return c.streamCache.GetOrLoad(streamKey, func() (*model.RoomInfo, error) {
-		return c.fetchStreamURL(roomID, qn)
-	})
-}
-
-// fetchStreamURL does the actual work of obtaining a stream URL (no caching).
-func (c *BilibiliClient) fetchStreamURL(roomID string, qn int) (*model.RoomInfo, error) {
-	// Room ID cache
-	realRoomID, err := c.roomIDCache.GetOrLoad(roomID, func() (string, error) {
-		return c.GetRealRoomID(roomID)
-	})
+	// Resolve real room ID
+	realRoomID, err := c.GetRealRoomID(roomID)
 	if err != nil {
 		if c.verbose {
 			fmt.Printf("Warning: failed to resolve real room ID: %v\n", err)
@@ -178,6 +151,11 @@ func (c *BilibiliClient) fetchStreamURL(roomID string, qn int) (*model.RoomInfo,
 
 	if c.verbose {
 		fmt.Printf("Real room ID: %s\n", realRoomID)
+	}
+
+	// Default to highest quality if not specified
+	if qn == 0 {
+		qn = 10000 // 原画
 	}
 
 	// Build API URL with parameters
@@ -210,9 +188,12 @@ func (c *BilibiliClient) fetchStreamURL(roomID string, qn int) (*model.RoomInfo,
 		return nil, fmt.Errorf("play info API error %d: %s", resp.Code, resp.Message)
 	}
 
-	// Check if room is live — return error so offline results are not cached
+	// Check if room is live
 	if resp.Data.LiveStatus != 1 {
-		return nil, ErrRoomOffline
+		return &model.RoomInfo{
+			RoomID: realRoomID,
+			IsLive: false,
+		}, nil
 	}
 
 	// Extract stream URL

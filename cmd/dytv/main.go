@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -80,11 +79,6 @@ func main() {
 	fmt.Println("    GET /health                      - Health check")
 	fmt.Println()
 
-	// Start cache cleanup goroutines
-	cacheStop := make(chan struct{})
-	douyuClient.StartCacheCleanup(cacheStop)
-	bilibiliClient.StartCacheCleanup(cacheStop)
-
 	// Graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -98,8 +92,6 @@ func main() {
 
 	<-quit
 	fmt.Println("\nShutting down server...")
-
-	close(cacheStop)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -158,11 +150,12 @@ func serveDouyuStream(w http.ResponseWriter, r *http.Request, roomID string) {
 
 	info, err := douyuClient.GetStreamURL(roomID, rate)
 	if err != nil {
-		if errors.Is(err, api.ErrRoomOffline) {
-			http.Error(w, "room is offline", http.StatusNotFound)
-		} else {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if !info.IsLive || info.StreamURL == "" {
+		http.Error(w, "room is offline", http.StatusNotFound)
 		return
 	}
 
@@ -182,7 +175,8 @@ func serveDouyuStream(w http.ResponseWriter, r *http.Request, roomID string) {
 
 	if isM3U8 {
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
 		playlist := "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:600\n#EXTINF:-1,\n" + info.StreamURL + "\n"
 		_, _ = w.Write([]byte(playlist))
 		return
@@ -215,11 +209,12 @@ func handleBilibiliLive(w http.ResponseWriter, r *http.Request) {
 
 	info, err := bilibiliClient.GetStreamURL(roomID, qn)
 	if err != nil {
-		if errors.Is(err, api.ErrRoomOffline) {
-			http.Error(w, "room is offline", http.StatusNotFound)
-		} else {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if !info.IsLive || info.StreamURL == "" {
+		http.Error(w, "room is offline", http.StatusNotFound)
 		return
 	}
 
