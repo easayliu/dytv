@@ -133,12 +133,6 @@ func handleDouyuLive(w http.ResponseWriter, r *http.Request) {
 
 // serveDouyuStream is the shared logic for Douyu stream handlers
 func serveDouyuStream(w http.ResponseWriter, r *http.Request, roomID string) {
-	// 支持 .m3u8 后缀，返回动态 HLS 播放列表
-	isM3U8 := strings.HasSuffix(roomID, ".m3u8")
-	if isM3U8 {
-		roomID = strings.TrimSuffix(roomID, ".m3u8")
-	}
-
 	rate := 0
 	if rateStr := r.URL.Query().Get("rate"); rateStr != "" {
 		fmt.Sscanf(rateStr, "%d", &rate)
@@ -170,15 +164,6 @@ func serveDouyuStream(w http.ResponseWriter, r *http.Request, roomID string) {
 			"stream_url": info.StreamURL,
 			"multirates": info.Multirates,
 		})
-		return
-	}
-
-	if isM3U8 {
-		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
-		w.Header().Set("Pragma", "no-cache")
-		playlist := "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:600\n#EXTINF:-1,\n" + info.StreamURL + "\n"
-		_, _ = w.Write([]byte(playlist))
 		return
 	}
 
@@ -345,8 +330,8 @@ func handlePlaylist(w http.ResponseWriter, r *http.Request) {
 				channelName = info.RoomName
 			}
 
-			// 使用代理地址，.m3u8 后缀让播放器断流后自动刷新 URL
-			proxyURL := fmt.Sprintf("%s/live/%s.m3u8", baseURL, info.RoomID)
+			// 使用代理地址
+			proxyURL := fmt.Sprintf("%s/live/%s", baseURL, info.RoomID)
 			if rate > 0 {
 				proxyURL = fmt.Sprintf("%s?rate=%d", proxyURL, rate)
 			}
@@ -405,7 +390,7 @@ func handleDouyuRecPlaylist(w http.ResponseWriter, r *http.Request) {
 
 	for _, item := range items {
 		roomID := strconv.Itoa(item.BizID)
-		proxyURL := fmt.Sprintf("%s/live/douyu/%s.m3u8", baseURL, roomID)
+		proxyURL := fmt.Sprintf("%s/live/douyu/%s", baseURL, roomID)
 		// 过滤换行符防止 M3U 内容注入
 		name := strings.NewReplacer("\n", "", "\r", "").Replace(item.Keyword)
 		playlist.WriteString(fmt.Sprintf("#EXTINF:-1,%s\n", name))
@@ -463,7 +448,7 @@ func handleDouyuFollowPlaylist(w http.ResponseWriter, r *http.Request) {
 
 	for _, room := range rooms {
 		roomID := strconv.Itoa(room.RoomID)
-		proxyURL := fmt.Sprintf("%s/live/douyu/%s.m3u8", baseURL, roomID)
+		proxyURL := fmt.Sprintf("%s/live/douyu/%s", baseURL, roomID)
 		name := room.Nickname
 		if room.RoomName != "" {
 			name = room.RoomName
