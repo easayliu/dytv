@@ -24,6 +24,21 @@ var (
 	bilibiliClient = api.NewBilibiliClient()
 )
 
+// writePlaylistEntry writes a single M3U entry for a room (highest quality only).
+func writePlaylistEntry(
+	playlist *strings.Builder,
+	name, logo, groupTitle, baseURL, roomID, platform string,
+) {
+	entryURL := fmt.Sprintf("%s/live/%s/%s", baseURL, platform, roomID)
+
+	if logo != "" {
+		fmt.Fprintf(playlist, "#EXTINF:-1 group-title=\"%s\" tvg-logo=\"%s\",%s\n", groupTitle, logo, name)
+	} else {
+		fmt.Fprintf(playlist, "#EXTINF:-1 group-title=\"%s\",%s\n", groupTitle, name)
+	}
+	playlist.WriteString(entryURL + "\n")
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -54,16 +69,17 @@ func main() {
 		Addr:         addr,
 		Handler:      mux,
 		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 60 * time.Second,
+		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 	fmt.Printf("Starting server on %s\n", addr)
 	fmt.Println("Endpoints:")
 	fmt.Println("  Douyu (斗鱼):")
-	fmt.Println("    GET /live/{room_id}              - Redirect to FLV stream (default: Douyu)")
-	fmt.Println("    GET /live/douyu/{room_id}        - Redirect to Douyu FLV stream")
-	fmt.Println("    GET /live/douyu/{room_id}?format=json  - Return stream info as JSON")
-	fmt.Println("    GET /live/douyu/{room_id}?rate=0 - Specify quality (0=原画, 2=超清, 3=流畅)")
+	fmt.Println("    GET /live/{room_id}                      - 302 redirect to CDN FLV (default: Douyu)")
+	fmt.Println("    GET /live/douyu/{room_id}                - 302 redirect to CDN FLV URL")
+	fmt.Println("    GET /live/douyu/{room_id}?format=hls      - 302 redirect to HLS stream")
+	fmt.Println("    GET /live/douyu/{room_id}?format=json     - Return stream info as JSON")
+	fmt.Println("    GET /live/douyu/{room_id}?rate=0          - Specify quality (0=原画, 2=超清, 3=流畅)")
 	fmt.Println("  Bilibili (哔哩哔哩):")
 	fmt.Println("    GET /live/bilibili/{room_id}     - Redirect to Bilibili FLV stream")
 	fmt.Println("    GET /live/bilibili/{room_id}?format=json  - Return stream info as JSON")
@@ -142,32 +158,59 @@ func serveDouyuStream(w http.ResponseWriter, r *http.Request, roomID string) {
 		}
 	}
 
-	info, err := douyuClient.GetStreamURL(roomID, rate)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if !info.IsLive || info.StreamURL == "" {
-		http.Error(w, "room is offline", http.StatusNotFound)
-		return
-	}
-
 	format := strings.ToLower(r.URL.Query().Get("format"))
-	if format == "json" {
+
+	switch format {
+	case "json":
+		info, err := douyuClient.GetStreamURL(roomID, rate)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !info.IsLive || info.StreamURL == "" {
+			http.Error(w, "room is offline", http.StatusNotFound)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"room_id":    info.RoomID,
 			"platform":   "douyu",
 			"is_live":    info.IsLive,
 			"flv_url":    info.FlvURL,
+			"hls_url":    info.HlsURL,
 			"stream_url": info.StreamURL,
 			"multirates": info.Multirates,
 		})
-		return
-	}
 
-	http.Redirect(w, r, info.StreamURL, http.StatusFound)
+	case "hls":
+		info, err := douyuClient.GetStreamURL(roomID, rate)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !info.IsLive || info.StreamURL == "" {
+			http.Error(w, "room is offline", http.StatusNotFound)
+			return
+		}
+		if info.HlsURL == "" {
+			http.Error(w, "HLS stream not available for this room", http.StatusNotFound)
+			return
+		}
+		http.Redirect(w, r, info.HlsURL, http.StatusFound)
+
+	default:
+		// Default: 302 redirect to CDN FLV URL
+		info, err := douyuClient.GetStreamURL(roomID, rate)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !info.IsLive || info.StreamURL == "" {
+			http.Error(w, "room is offline", http.StatusNotFound)
+			return
+		}
+		http.Redirect(w, r, info.StreamURL, http.StatusFound)
+	}
 }
 
 // handleBilibiliLive handles Bilibili-specific live requests
@@ -229,13 +272,11 @@ func handlePlaylist(w http.ResponseWriter, r *http.Request) {
 
 	roomIDs := strings.Split(roomsParam, ",")
 
-	// 获取平台参数，默认为 douyu
 	platform := strings.ToLower(r.URL.Query().Get("platform"))
 	if platform == "" {
 		platform = "douyu"
 	}
 
-	// 获取基础 URL 用于构建代理地址
 	baseURL := r.URL.Query().Get("base_url")
 	if baseURL == "" {
 		scheme := "http"
@@ -248,7 +289,6 @@ func handlePlaylist(w http.ResponseWriter, r *http.Request) {
 	}
 	baseURL = strings.TrimSuffix(baseURL, "/")
 
-	// 构建 M3U 播放列表
 	var playlist strings.Builder
 	playlist.WriteString("#EXTM3U\n")
 	var filename string
@@ -256,30 +296,14 @@ func handlePlaylist(w http.ResponseWriter, r *http.Request) {
 	switch platform {
 	case "bilibili":
 		filename = "bilibili.m3u"
-		// 获取清晰度参数
-		qn := 0
-		if qnStr := r.URL.Query().Get("qn"); qnStr != "" {
-			fmt.Sscanf(qnStr, "%d", &qn)
-		} else if rateStr := r.URL.Query().Get("rate"); rateStr != "" {
-			fmt.Sscanf(rateStr, "%d", &qn)
-		} else if q := r.URL.Query().Get("quality"); q != "" {
-			if qnVal, ok := model.BilibiliQualityMap[strings.ToLower(q)]; ok {
-				qn = qnVal
-			}
-		}
-
 		for _, roomID := range roomIDs {
 			roomID = strings.TrimSpace(roomID)
 			if roomID == "" {
 				continue
 			}
 
-			info, err := bilibiliClient.GetStreamURL(roomID, qn)
-			if err != nil {
-				continue
-			}
-
-			if !info.IsLive || info.FlvURL == "" {
+			info, err := bilibiliClient.GetStreamURL(roomID, 0)
+			if err != nil || !info.IsLive || info.FlvURL == "" {
 				continue
 			}
 
@@ -288,40 +312,19 @@ func handlePlaylist(w http.ResponseWriter, r *http.Request) {
 				channelName = info.RoomName
 			}
 
-			// 使用代理地址
-			proxyURL := fmt.Sprintf("%s/live/bilibili/%s", baseURL, info.RoomID)
-			if qn > 0 {
-				proxyURL = fmt.Sprintf("%s?qn=%d", proxyURL, qn)
-			}
-
-			playlist.WriteString(fmt.Sprintf("#EXTINF:-1,%s\n", channelName))
-			playlist.WriteString(proxyURL + "\n")
+			writePlaylistEntry(&playlist, channelName, "", "哔哩哔哩", baseURL, info.RoomID, "bilibili")
 		}
 
 	default: // douyu
 		filename = "douyu.m3u"
-		// 获取清晰度参数
-		rate := 0
-		if rateStr := r.URL.Query().Get("rate"); rateStr != "" {
-			fmt.Sscanf(rateStr, "%d", &rate)
-		} else if q := r.URL.Query().Get("quality"); q != "" {
-			if rateVal, ok := model.QualityMap[strings.ToLower(q)]; ok {
-				rate = rateVal
-			}
-		}
-
 		for _, roomID := range roomIDs {
 			roomID = strings.TrimSpace(roomID)
 			if roomID == "" {
 				continue
 			}
 
-			info, err := douyuClient.GetStreamURL(roomID, rate)
-			if err != nil {
-				continue
-			}
-
-			if !info.IsLive || info.FlvURL == "" {
+			info, err := douyuClient.GetStreamURL(roomID, 0)
+			if err != nil || !info.IsLive || info.FlvURL == "" {
 				continue
 			}
 
@@ -330,14 +333,7 @@ func handlePlaylist(w http.ResponseWriter, r *http.Request) {
 				channelName = info.RoomName
 			}
 
-			// 使用代理地址
-			proxyURL := fmt.Sprintf("%s/live/%s", baseURL, info.RoomID)
-			if rate > 0 {
-				proxyURL = fmt.Sprintf("%s?rate=%d", proxyURL, rate)
-			}
-
-			playlist.WriteString(fmt.Sprintf("#EXTINF:-1,%s\n", channelName))
-			playlist.WriteString(proxyURL + "\n")
+			writePlaylistEntry(&playlist, channelName, "", "斗鱼", baseURL, info.RoomID, "douyu")
 		}
 	}
 
@@ -390,11 +386,8 @@ func handleDouyuRecPlaylist(w http.ResponseWriter, r *http.Request) {
 
 	for _, item := range items {
 		roomID := strconv.Itoa(item.BizID)
-		proxyURL := fmt.Sprintf("%s/live/douyu/%s", baseURL, roomID)
-		// 过滤换行符防止 M3U 内容注入
 		name := strings.NewReplacer("\n", "", "\r", "").Replace(item.Keyword)
-		playlist.WriteString(fmt.Sprintf("#EXTINF:-1,%s\n", name))
-		playlist.WriteString(proxyURL + "\n")
+		writePlaylistEntry(&playlist, name, "", "推荐", baseURL, roomID, "douyu")
 	}
 
 	w.Header().Set("Content-Type", "audio/x-mpegurl")
@@ -424,8 +417,8 @@ func handleDouyuFollowPlaylist(w http.ResponseWriter, r *http.Request) {
 	}
 
 	online := 0
-	for _, r := range rooms {
-		if r.ShowStatus == 1 {
+	for _, rm := range rooms {
+		if rm.ShowStatus == 1 {
 			online++
 		}
 	}
@@ -448,7 +441,6 @@ func handleDouyuFollowPlaylist(w http.ResponseWriter, r *http.Request) {
 
 	for _, room := range rooms {
 		roomID := strconv.Itoa(room.RoomID)
-		proxyURL := fmt.Sprintf("%s/live/douyu/%s", baseURL, roomID)
 		name := room.Nickname
 		if room.RoomName != "" {
 			name = room.RoomName
@@ -458,12 +450,7 @@ func handleDouyuFollowPlaylist(w http.ResponseWriter, r *http.Request) {
 		if logo == "" {
 			logo = room.AvatarSmall
 		}
-		if logo != "" {
-			playlist.WriteString(fmt.Sprintf("#EXTINF:-1 tvg-logo=\"%s\",%s\n", logo, name))
-		} else {
-			playlist.WriteString(fmt.Sprintf("#EXTINF:-1,%s\n", name))
-		}
-		playlist.WriteString(proxyURL + "\n")
+		writePlaylistEntry(&playlist, name, logo, "关注", baseURL, roomID, "douyu")
 	}
 
 	w.Header().Set("Content-Type", "audio/x-mpegurl")

@@ -8,6 +8,7 @@ type RoomInfo struct {
 	IsLive     bool         `json:"is_live"`
 	StreamURL  string       `json:"stream_url"`
 	FlvURL     string       `json:"flv_url"`
+	HlsURL     string       `json:"hls_url"`
 	Multirates []StreamRate `json:"multirates"`
 }
 

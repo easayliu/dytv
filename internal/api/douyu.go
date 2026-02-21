@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dop251/goja"
@@ -27,15 +28,38 @@ const (
 	DouyuFollowListAPI = "https://www.douyu.com/wgapi/livenc/liveweb/follow/list"
 )
 
+type jsCacheItem struct {
+	code      string
+	expiresAt time.Time
+}
+
+type roomIDCacheItem struct {
+	realID    string
+	expiresAt time.Time
+}
+
 type DouyuClient struct {
 	httpClient *HTTPClient
 	verbose    bool
+
+	jsMu    sync.RWMutex
+	jsCache map[string]jsCacheItem
+
+	roomMu    sync.RWMutex
+	roomCache map[string]roomIDCacheItem
 }
+
+const (
+	jsCacheTTL     = 10 * time.Minute
+	roomIDCacheTTL = 24 * time.Hour
+)
 
 func NewDouyuClient() *DouyuClient {
 	return &DouyuClient{
 		httpClient: NewHTTPClient(),
 		verbose:    false,
+		jsCache:    make(map[string]jsCacheItem),
+		roomCache:  make(map[string]roomIDCacheItem),
 	}
 }
 
@@ -44,6 +68,14 @@ func (c *DouyuClient) SetVerbose(verbose bool) {
 }
 
 func (c *DouyuClient) GetRealRoomID(roomID string) (string, error) {
+	// Check cache first
+	c.roomMu.RLock()
+	if item, ok := c.roomCache[roomID]; ok && time.Now().Before(item.expiresAt) {
+		c.roomMu.RUnlock()
+		return item.realID, nil
+	}
+	c.roomMu.RUnlock()
+
 	roomURL := fmt.Sprintf(DouyuRoomURL, url.PathEscape(roomID))
 	body, err := c.httpClient.Get(roomURL)
 	if err != nil {
@@ -58,15 +90,25 @@ func (c *DouyuClient) GetRealRoomID(roomID string) (string, error) {
 		`rid['"]*\s*[:=]\s*['"]?(\d+)`,
 	}
 
+	realID := roomID
 	for _, p := range patterns {
 		re := regexp.MustCompile(p)
 		matches := re.FindStringSubmatch(html)
 		if len(matches) >= 2 {
-			return matches[1], nil
+			realID = matches[1]
+			break
 		}
 	}
 
-	return roomID, nil
+	// Store in cache
+	c.roomMu.Lock()
+	c.roomCache[roomID] = roomIDCacheItem{
+		realID:    realID,
+		expiresAt: time.Now().Add(roomIDCacheTTL),
+	}
+	c.roomMu.Unlock()
+
+	return realID, nil
 }
 
 func (c *DouyuClient) GetStreamURL(roomID string, rate int) (*model.RoomInfo, error) {
@@ -150,10 +192,17 @@ func (c *DouyuClient) GetStreamURL(roomID string, rate int) (*model.RoomInfo, er
 		flvURL = streamURL
 	}
 
+	// Build HLS URL: prefer API-provided, fallback to deriving from FLV URL
+	hlsURL := streamData.HlsURL
+	if hlsURL == "" && flvURL != "" {
+		hlsURL = strings.Replace(flvURL, ".flv", ".m3u8", 1)
+	}
+
 	roomInfo := &model.RoomInfo{
 		RoomID:     realRoomID,
 		StreamURL:  streamURL,
 		FlvURL:     flvURL,
+		HlsURL:     hlsURL,
 		Multirates: streamData.Multirates,
 		IsLive:     streamURL != "",
 	}
@@ -162,6 +211,14 @@ func (c *DouyuClient) GetStreamURL(roomID string, rate int) (*model.RoomInfo, er
 }
 
 func (c *DouyuClient) getEncryptedJS(roomID string) (string, error) {
+	// Check cache first
+	c.jsMu.RLock()
+	if item, ok := c.jsCache[roomID]; ok && time.Now().Before(item.expiresAt) {
+		c.jsMu.RUnlock()
+		return item.code, nil
+	}
+	c.jsMu.RUnlock()
+
 	swfURL := fmt.Sprintf(DouyuSwfAPI, url.QueryEscape(roomID))
 	body, err := c.httpClient.Get(swfURL)
 	if err != nil {
@@ -185,6 +242,14 @@ func (c *DouyuClient) getEncryptedJS(roomID string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("no JS code found for room %s", roomID)
 	}
+
+	// Store in cache
+	c.jsMu.Lock()
+	c.jsCache[roomID] = jsCacheItem{
+		code:      jsCode,
+		expiresAt: time.Now().Add(jsCacheTTL),
+	}
+	c.jsMu.Unlock()
 
 	return jsCode, nil
 }

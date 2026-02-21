@@ -169,6 +169,7 @@ func (c *HTTPClient) GetWithHeaders(url string, extraHeaders map[string]string) 
 	return body, nil
 }
 
+
 // PostWithHeaders performs a POST request with custom headers
 func (c *HTTPClient) PostWithHeaders(url string, data string, extraHeaders map[string]string) ([]byte, error) {
 	req, err := http.NewRequest("POST", url, strings.NewReader(data))
