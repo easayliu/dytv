@@ -5,11 +5,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -23,6 +26,25 @@ var (
 	douyuClient    = api.NewDouyuClient()
 	bilibiliClient = api.NewBilibiliClient()
 )
+
+// proxyClient is used for proxying HLS streams from CDN.
+var proxyClient = &http.Client{
+	Timeout: 30 * time.Second,
+}
+
+// hlsURLCache caches Douyu HLS URLs to reduce API calls
+// when HLS players refresh the M3U8 every few seconds.
+var (
+	hlsURLCacheMu sync.RWMutex
+	hlsURLCache   = make(map[string]hlsURLCacheEntry)
+)
+
+type hlsURLCacheEntry struct {
+	hlsURL    string
+	expiresAt time.Time
+}
+
+const hlsURLCacheTTL = 2 * time.Minute
 
 // writePlaylistEntry writes a single M3U entry for a room (highest quality only).
 func writePlaylistEntry(
@@ -54,17 +76,23 @@ func main() {
 	mux.HandleFunc("/live/douyu/", handleDouyuLive)
 	mux.HandleFunc("/live/", handleLive) // Default to Douyu for backward compatibility
 
+	// HLS proxy (for remote deployment where 302 redirect fails due to IP-bound tokens)
+	mux.HandleFunc("/proxy/ts", handleProxyTS)
+
 	// Bilibili routes
 	mux.HandleFunc("/live/bilibili/", handleBilibiliLive)
 
-	// Login routes
+	// Login routes - Douyu
 	mux.HandleFunc("/login/qrcode", handleLoginQRCode)
 	mux.HandleFunc("/login/poll", handleLoginPoll)
+
+	// Login page (index)
 	mux.HandleFunc("/login", handleLoginPage)
 
 	mux.HandleFunc("/playlist.m3u", handlePlaylist)
 	mux.HandleFunc("/playlist/douyu/rec.m3u", handleDouyuRecPlaylist)
 	mux.HandleFunc("/playlist/douyu/follow.m3u", handleDouyuFollowPlaylist)
+	mux.HandleFunc("/playlist/bilibili/follow.m3u", handleBilibiliFollowPlaylist)
 	mux.HandleFunc("/health", handleHealth)
 
 	addr := ":" + port
@@ -92,8 +120,9 @@ func main() {
 	fmt.Println("    GET /playlist.m3u?rooms=1,2,3&platform=bilibili")
 	fmt.Println("    GET /playlist/douyu/rec.m3u                    - Douyu recommended rooms playlist")
 	fmt.Println("    GET /playlist/douyu/follow.m3u                 - Douyu followed rooms playlist")
+	fmt.Println("    GET /playlist/bilibili/follow.m3u              - Bilibili followed rooms playlist")
 	fmt.Println("  Login (登录):")
-	fmt.Println("    GET /login                       - Douyu QR code login page")
+	fmt.Println("    GET /login                       - Login page (Douyu)")
 	fmt.Println("  Health:")
 	fmt.Println("    GET /health                      - Health check")
 	fmt.Println()
@@ -186,20 +215,57 @@ func serveDouyuStream(w http.ResponseWriter, r *http.Request, roomID string) {
 		})
 
 	case "hls":
-		info, err := douyuClient.GetStreamURL(roomID, rate)
+		// Use cached HLS URL to reduce Douyu API calls
+		// (HLS players refresh M3U8 every few seconds)
+		cacheKey := fmt.Sprintf("douyu:%s:%d", roomID, rate)
+		var hlsURL string
+
+		hlsURLCacheMu.RLock()
+		if entry, ok := hlsURLCache[cacheKey]; ok && time.Now().Before(entry.expiresAt) {
+			hlsURL = entry.hlsURL
+		}
+		hlsURLCacheMu.RUnlock()
+
+		if hlsURL == "" {
+			info, err := douyuClient.GetStreamURL(roomID, rate)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if !info.IsLive || info.StreamURL == "" {
+				http.Error(w, "room is offline", http.StatusNotFound)
+				return
+			}
+			if info.HlsURL == "" {
+				http.Error(w, "HLS stream not available for this room", http.StatusNotFound)
+				return
+			}
+			hlsURL = info.HlsURL
+
+			hlsURLCacheMu.Lock()
+			hlsURLCache[cacheKey] = hlsURLCacheEntry{
+				hlsURL:    hlsURL,
+				expiresAt: time.Now().Add(hlsURLCacheTTL),
+			}
+			hlsURLCacheMu.Unlock()
+		}
+
+		// Proxy the M3U8 instead of 302 redirect, so the server's IP
+		// (which matches the token) is used for CDN requests.
+		content, err := fetchAndRewriteM3U8(hlsURL)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			// Invalidate cache so next request gets a fresh URL
+			hlsURLCacheMu.Lock()
+			delete(hlsURLCache, cacheKey)
+			hlsURLCacheMu.Unlock()
+			http.Error(w, "failed to proxy HLS: "+err.Error(), http.StatusBadGateway)
 			return
 		}
-		if !info.IsLive || info.StreamURL == "" {
-			http.Error(w, "room is offline", http.StatusNotFound)
-			return
-		}
-		if info.HlsURL == "" {
-			http.Error(w, "HLS stream not available for this room", http.StatusNotFound)
-			return
-		}
-		http.Redirect(w, r, info.HlsURL, http.StatusFound)
+
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		_, _ = w.Write(content)
 
 	default:
 		// Default: 302 redirect to CDN FLV URL
@@ -214,6 +280,151 @@ func serveDouyuStream(w http.ResponseWriter, r *http.Request, roomID string) {
 		}
 		http.Redirect(w, r, info.StreamURL, http.StatusFound)
 	}
+}
+
+// fetchAndRewriteM3U8 fetches the M3U8 manifest from CDN and rewrites
+// segment URLs to go through our proxy, so the server's IP is used for all CDN requests.
+func fetchAndRewriteM3U8(hlsURL string) ([]byte, error) {
+	req, err := http.NewRequest("GET", hlsURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", api.UserAgent)
+	req.Header.Set("Referer", "https://www.douyu.com/")
+	req.Header.Set("Origin", "https://www.douyu.com")
+
+	resp, err := proxyClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("CDN returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	// Derive base URL for resolving relative segment URLs
+	parsed, err := url.Parse(hlsURL)
+	if err != nil {
+		return nil, err
+	}
+	lastSlash := strings.LastIndex(parsed.Path, "/")
+	baseURL := parsed.Scheme + "://" + parsed.Host + parsed.Path[:lastSlash+1]
+
+	return []byte(rewriteM3U8(string(body), baseURL)), nil
+}
+
+// rewriteM3U8 rewrites segment URLs in M3U8 content to go through /proxy/ts.
+func rewriteM3U8(content, baseURL string) string {
+	lines := strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
+	var result strings.Builder
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			result.WriteString(line)
+			result.WriteByte('\n')
+			continue
+		}
+		// This is a segment URL line
+		segURL := trimmed
+		if !strings.HasPrefix(segURL, "http://") && !strings.HasPrefix(segURL, "https://") {
+			segURL = baseURL + segURL
+		}
+		encoded := base64.RawURLEncoding.EncodeToString([]byte(segURL))
+		result.WriteString("/proxy/ts?url=")
+		result.WriteString(encoded)
+		result.WriteByte('\n')
+	}
+	return result.String()
+}
+
+// handleProxyTS proxies TS segments (and sub-playlists) from CDN.
+func handleProxyTS(w http.ResponseWriter, r *http.Request) {
+	encoded := r.URL.Query().Get("url")
+	if encoded == "" {
+		http.Error(w, "url parameter required", http.StatusBadRequest)
+		return
+	}
+
+	urlBytes, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		http.Error(w, "invalid url encoding", http.StatusBadRequest)
+		return
+	}
+
+	targetURL := string(urlBytes)
+
+	// Security: only allow proxying to known CDN domains
+	parsed, err := url.Parse(targetURL)
+	if err != nil || !isAllowedProxyDomain(parsed.Host) {
+		http.Error(w, "domain not allowed", http.StatusForbidden)
+		return
+	}
+
+	req, err := http.NewRequest("GET", targetURL, nil)
+	if err != nil {
+		http.Error(w, "bad request", http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("User-Agent", api.UserAgent)
+	req.Header.Set("Referer", "https://www.douyu.com/")
+	req.Header.Set("Origin", "https://www.douyu.com")
+
+	resp, err := proxyClient.Do(req)
+	if err != nil {
+		http.Error(w, "upstream error", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	// If response is M3U8 (sub-playlist), rewrite URLs too
+	ct := resp.Header.Get("Content-Type")
+	if strings.Contains(ct, "mpegurl") || strings.HasSuffix(parsed.Path, ".m3u8") {
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			http.Error(w, "read error", http.StatusBadGateway)
+			return
+		}
+		lastSlash := strings.LastIndex(parsed.Path, "/")
+		baseURL := parsed.Scheme + "://" + parsed.Host + parsed.Path[:lastSlash+1]
+		content := rewriteM3U8(string(body), baseURL)
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		_, _ = w.Write([]byte(content))
+		return
+	}
+
+	// Stream TS segment directly
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
+	if cl := resp.Header.Get("Content-Length"); cl != "" {
+		w.Header().Set("Content-Length", cl)
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+// isAllowedProxyDomain checks if a host is in the allowlist for proxying.
+func isAllowedProxyDomain(host string) bool {
+	allowedSuffixes := []string{
+		".douyucdn.cn",
+		".douyucdn2.cn",
+		".douyu.com",
+	}
+	for _, suffix := range allowedSuffixes {
+		if strings.HasSuffix(host, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 // handleBilibiliLive handles Bilibili-specific live requests
@@ -554,6 +765,68 @@ func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// handleBilibiliFollowPlaylist generates a playlist from the user's Bilibili follow list.
+func handleBilibiliFollowPlaylist(w http.ResponseWriter, r *http.Request) {
+	cookie := r.Header.Get("X-Bilibili-Cookie")
+	if cookie == "" {
+		cookie = os.Getenv("BILIBILI_COOKIE")
+	}
+	if cookie == "" {
+		if saved, err := config.LoadBilibiliCookie(); err == nil && saved != "" {
+			cookie = saved
+		}
+	}
+	if cookie == "" {
+		http.Error(w, "cookie is required (X-Bilibili-Cookie header, BILIBILI_COOKIE env, or login via /login/bilibili)", http.StatusBadRequest)
+		return
+	}
+
+	rooms, err := bilibiliClient.BilibiliFollowList(cookie)
+	if err != nil {
+		http.Error(w, "failed to get follow list: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	online := 0
+	for _, rm := range rooms {
+		if rm.LiveStatus == 1 {
+			online++
+		}
+	}
+	fmt.Printf("[bilibili-follow] total=%d online=%d\n", len(rooms), online)
+
+	baseURL := r.URL.Query().Get("base_url")
+	if baseURL == "" {
+		scheme := "http"
+		if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+			scheme = proto
+		} else if r.TLS != nil {
+			scheme = "https"
+		}
+		baseURL = fmt.Sprintf("%s://%s", scheme, r.Host)
+	}
+	baseURL = strings.TrimSuffix(baseURL, "/")
+
+	format := strings.ToLower(r.URL.Query().Get("format"))
+
+	var playlist strings.Builder
+	playlist.WriteString("#EXTM3U\n")
+
+	for _, room := range rooms {
+		roomID := strconv.Itoa(room.RoomID)
+		name := room.Uname
+		if room.Title != "" {
+			name = room.Title
+		}
+		name = strings.NewReplacer("\n", "", "\r", "").Replace(name)
+		writePlaylistEntry(&playlist, name, room.Face, "关注", baseURL, roomID, "bilibili", format)
+	}
+
+	w.Header().Set("Content-Type", "audio/x-mpegurl")
+	w.Header().Set("Content-Disposition", `attachment; filename="bilibili_follow.m3u"`)
+	_, _ = w.Write([]byte(playlist.String()))
+}
+
 const loginHTML = `<!DOCTYPE html>
 <html lang="zh">
 <head>
@@ -646,3 +919,4 @@ fetchQR();
 </script>
 </body>
 </html>`
+

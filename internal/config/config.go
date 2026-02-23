@@ -44,3 +44,24 @@ func SaveCookie(cookie string) error {
 	}
 	return os.WriteFile(filepath.Join(dir, "cookie"), []byte(cookie), 0600)
 }
+
+// LoadBilibiliCookie reads the Bilibili cookie from the config directory.
+func LoadBilibiliCookie() (string, error) {
+	data, err := os.ReadFile(filepath.Join(cookieDir(), "bilibili_cookie"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
+// SaveBilibiliCookie writes the Bilibili cookie to the config directory.
+func SaveBilibiliCookie(cookie string) error {
+	dir := cookieDir()
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "bilibili_cookie"), []byte(cookie), 0600)
+}
