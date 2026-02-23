@@ -27,9 +27,12 @@ var (
 // writePlaylistEntry writes a single M3U entry for a room (highest quality only).
 func writePlaylistEntry(
 	playlist *strings.Builder,
-	name, logo, groupTitle, baseURL, roomID, platform string,
+	name, logo, groupTitle, baseURL, roomID, platform, format string,
 ) {
 	entryURL := fmt.Sprintf("%s/live/%s/%s", baseURL, platform, roomID)
+	if format != "" {
+		entryURL += "?format=" + format
+	}
 
 	if logo != "" {
 		fmt.Fprintf(playlist, "#EXTINF:-1 group-title=\"%s\" tvg-logo=\"%s\",%s\n", groupTitle, logo, name)
@@ -254,9 +257,15 @@ func handleBilibiliLive(w http.ResponseWriter, r *http.Request) {
 			"platform":   "bilibili",
 			"is_live":    info.IsLive,
 			"flv_url":    info.FlvURL,
+			"hls_url":    info.HlsURL,
 			"stream_url": info.StreamURL,
 			"multirates": info.Multirates,
 		})
+		return
+	}
+
+	if format == "hls" && info.HlsURL != "" {
+		http.Redirect(w, r, info.HlsURL, http.StatusFound)
 		return
 	}
 
@@ -289,6 +298,8 @@ func handlePlaylist(w http.ResponseWriter, r *http.Request) {
 	}
 	baseURL = strings.TrimSuffix(baseURL, "/")
 
+	format := strings.ToLower(r.URL.Query().Get("format"))
+
 	var playlist strings.Builder
 	playlist.WriteString("#EXTM3U\n")
 	var filename string
@@ -312,7 +323,7 @@ func handlePlaylist(w http.ResponseWriter, r *http.Request) {
 				channelName = info.RoomName
 			}
 
-			writePlaylistEntry(&playlist, channelName, "", "哔哩哔哩", baseURL, info.RoomID, "bilibili")
+			writePlaylistEntry(&playlist, channelName, "", "哔哩哔哩", baseURL, info.RoomID, "bilibili", format)
 		}
 
 	default: // douyu
@@ -333,7 +344,7 @@ func handlePlaylist(w http.ResponseWriter, r *http.Request) {
 				channelName = info.RoomName
 			}
 
-			writePlaylistEntry(&playlist, channelName, "", "斗鱼", baseURL, info.RoomID, "douyu")
+			writePlaylistEntry(&playlist, channelName, "", "斗鱼", baseURL, info.RoomID, "douyu", format)
 		}
 	}
 
@@ -384,10 +395,11 @@ func handleDouyuRecPlaylist(w http.ResponseWriter, r *http.Request) {
 	var playlist strings.Builder
 	playlist.WriteString("#EXTM3U\n")
 
+	format := strings.ToLower(r.URL.Query().Get("format"))
 	for _, item := range items {
 		roomID := strconv.Itoa(item.BizID)
 		name := strings.NewReplacer("\n", "", "\r", "").Replace(item.Keyword)
-		writePlaylistEntry(&playlist, name, "", "推荐", baseURL, roomID, "douyu")
+		writePlaylistEntry(&playlist, name, "", "推荐", baseURL, roomID, "douyu", format)
 	}
 
 	w.Header().Set("Content-Type", "audio/x-mpegurl")
@@ -436,6 +448,8 @@ func handleDouyuFollowPlaylist(w http.ResponseWriter, r *http.Request) {
 	}
 	baseURL = strings.TrimSuffix(baseURL, "/")
 
+	format := strings.ToLower(r.URL.Query().Get("format"))
+
 	var playlist strings.Builder
 	playlist.WriteString("#EXTM3U\n")
 
@@ -450,7 +464,7 @@ func handleDouyuFollowPlaylist(w http.ResponseWriter, r *http.Request) {
 		if logo == "" {
 			logo = room.AvatarSmall
 		}
-		writePlaylistEntry(&playlist, name, logo, "关注", baseURL, roomID, "douyu")
+		writePlaylistEntry(&playlist, name, logo, "关注", baseURL, roomID, "douyu", format)
 	}
 
 	w.Header().Set("Content-Type", "audio/x-mpegurl")

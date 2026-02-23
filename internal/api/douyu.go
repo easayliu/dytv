@@ -192,10 +192,12 @@ func (c *DouyuClient) GetStreamURL(roomID string, rate int) (*model.RoomInfo, er
 		flvURL = streamURL
 	}
 
-	// Build HLS URL: prefer API-provided, fallback to deriving from FLV URL
+	// Build HLS URL: derive from FLV URL and use ws1a CDN which supports M3U8
 	hlsURL := streamData.HlsURL
 	if hlsURL == "" && flvURL != "" {
 		hlsURL = strings.Replace(flvURL, ".flv", ".m3u8", 1)
+		// Most Douyu CDN nodes block M3U8 (403), but ws1a supports it
+		hlsURL = replaceDouyuCDNForHLS(hlsURL)
 	}
 
 	roomInfo := &model.RoomInfo{
@@ -209,6 +211,19 @@ func (c *DouyuClient) GetStreamURL(roomID string, rate int) (*model.RoomInfo, er
 
 	return roomInfo, nil
 }
+
+// replaceDouyuCDNForHLS replaces the CDN domain to one that supports M3U8.
+// Most Douyu CDN nodes (wsa, ws3a, etc.) block .m3u8 requests with 403,
+// but ws1a.douyucdn.cn serves HLS properly.
+func replaceDouyuCDNForHLS(hlsURL string) string {
+	// Match common Douyu CDN patterns: wsa, ws1a, ws2a, ws3a, ws3b, etc.
+	if reDouyuCDN == nil {
+		return hlsURL
+	}
+	return reDouyuCDN.ReplaceAllString(hlsURL, "ws1a.douyucdn.cn")
+}
+
+var reDouyuCDN = regexp.MustCompile(`ws\w*\.douyucdn\.cn`)
 
 func (c *DouyuClient) getEncryptedJS(roomID string) (string, error) {
 	// Check cache first

@@ -196,16 +196,22 @@ func (c *BilibiliClient) GetStreamURL(roomID string, qn int) (*model.RoomInfo, e
 		}, nil
 	}
 
-	// Extract stream URL
-	streamURL, multirates, err := c.extractStreamURL(resp.Data.PlayURLInfo)
+	// Extract stream URLs (FLV + HLS)
+	flvURL, hlsURL, multirates, err := c.extractStreamURLs(resp.Data.PlayURLInfo)
 	if err != nil {
 		return nil, fmt.Errorf("failed to extract stream URL: %w", err)
+	}
+
+	streamURL := flvURL
+	if streamURL == "" {
+		streamURL = hlsURL
 	}
 
 	roomInfo := &model.RoomInfo{
 		RoomID:     realRoomID,
 		StreamURL:  streamURL,
-		FlvURL:     streamURL,
+		FlvURL:     flvURL,
+		HlsURL:     hlsURL,
 		Multirates: multirates,
 		IsLive:     streamURL != "",
 	}
@@ -213,16 +219,15 @@ func (c *BilibiliClient) GetStreamURL(roomID string, qn int) (*model.RoomInfo, e
 	return roomInfo, nil
 }
 
-// extractStreamURL extracts the best stream URL from play info
-func (c *BilibiliClient) extractStreamURL(playURLInfo *bilibiliPlayURLInfo) (string, []model.StreamRate, error) {
+// extractStreamURLs extracts FLV and HLS stream URLs from play info
+func (c *BilibiliClient) extractStreamURLs(playURLInfo *bilibiliPlayURLInfo) (flvURL, hlsURL string, multirates []model.StreamRate, err error) {
 	if playURLInfo == nil || playURLInfo.Playurl == nil {
-		return "", nil, fmt.Errorf("no play URL info available")
+		return "", "", nil, fmt.Errorf("no play URL info available")
 	}
 
 	playURL := playURLInfo.Playurl
 
 	// Build multirates from quality descriptions
-	var multirates []model.StreamRate
 	for _, qnDesc := range playURL.GQnDesc {
 		multirates = append(multirates, model.StreamRate{
 			Name: qnDesc.Desc,
@@ -230,48 +235,46 @@ func (c *BilibiliClient) extractStreamURL(playURLInfo *bilibiliPlayURLInfo) (str
 		})
 	}
 
-	// Find the best stream URL (prefer FLV format)
-	for _, stream := range playURL.Stream {
-		// Prefer http_stream protocol
-		if stream.ProtocolName != "http_stream" {
-			continue
-		}
-
-		for _, format := range stream.Format {
-			// Prefer FLV format
-			if format.FormatName != "flv" {
+	// Extract best URL for a given protocol/format, preferring AVC codec
+	extractURL := func(targetProtocol, targetFormat string) string {
+		for _, stream := range playURL.Stream {
+			if stream.ProtocolName != targetProtocol {
 				continue
 			}
-
-			for _, codec := range format.Codec {
-				// Prefer AVC codec for better compatibility
-				if codec.CodecName != "avc" {
+			for _, format := range stream.Format {
+				if format.FormatName != targetFormat {
 					continue
 				}
-
-				if len(codec.URLInfo) > 0 && codec.BaseURL != "" {
-					urlInfo := codec.URLInfo[0]
-					streamURL := urlInfo.Host + codec.BaseURL + urlInfo.Extra
-					return streamURL, multirates, nil
+				// Prefer AVC codec
+				for _, codec := range format.Codec {
+					if codec.CodecName == "avc" && len(codec.URLInfo) > 0 && codec.BaseURL != "" {
+						urlInfo := codec.URLInfo[0]
+						return urlInfo.Host + codec.BaseURL + urlInfo.Extra
+					}
+				}
+				// Fallback: any codec
+				for _, codec := range format.Codec {
+					if len(codec.URLInfo) > 0 && codec.BaseURL != "" {
+						urlInfo := codec.URLInfo[0]
+						return urlInfo.Host + codec.BaseURL + urlInfo.Extra
+					}
 				}
 			}
 		}
+		return ""
 	}
 
-	// Fallback: try any available stream
-	for _, stream := range playURL.Stream {
-		for _, format := range stream.Format {
-			for _, codec := range format.Codec {
-				if len(codec.URLInfo) > 0 && codec.BaseURL != "" {
-					urlInfo := codec.URLInfo[0]
-					streamURL := urlInfo.Host + codec.BaseURL + urlInfo.Extra
-					return streamURL, multirates, nil
-				}
-			}
-		}
+	flvURL = extractURL("http_stream", "flv")
+	hlsURL = extractURL("http_hls", "ts")
+	if hlsURL == "" {
+		hlsURL = extractURL("http_hls", "fmp4")
 	}
 
-	return "", multirates, fmt.Errorf("no stream URL found")
+	if flvURL == "" && hlsURL == "" {
+		return "", "", multirates, fmt.Errorf("no stream URL found")
+	}
+
+	return flvURL, hlsURL, multirates, nil
 }
 
 // GetRoomStatus checks if a room is currently live
